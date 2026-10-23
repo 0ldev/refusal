@@ -13,4 +13,4 @@ __all__ = [
     "on_llm_execution",
     "register",
 ]
-__version__ = "0.1.0"
+__version__ = "0.1.1"

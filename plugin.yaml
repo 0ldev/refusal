@@ -1,6 +1,6 @@
 name: refusal
 label: Refusal
-version: 0.1.0
+version: 0.1.1
 description: Detects model refusals and deflections and retries the turn on a fallback model
 author: 0ldev
 license: MIT
