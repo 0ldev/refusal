@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import time
 
 from refusal import DetectionResult, RefusalDetector, detect, is_refusal
 
@@ -323,3 +324,20 @@ class TestTechnicalAndEdgeCases:
         res = detect(text)
         assert res.is_refusal is False
         assert is_refusal(text) is False
+
+
+class TestPatternTimingBounds:
+    """Regression tests for catastrophic-backtracking spans in patterns.py: a degenerate
+    reply must not stall the synchronous llm_execution middleware for seconds."""
+
+    def test_long_whitespace_run_does_not_stall(self):
+        text = "i cannot " + " " * 50_000
+        start = time.monotonic()
+        detect(text)
+        assert time.monotonic() - start < 0.5
+
+    def test_repeated_decline_line_does_not_stall(self):
+        text = "i cannot write " * 4000
+        start = time.monotonic()
+        detect(text)
+        assert time.monotonic() - start < 0.5
