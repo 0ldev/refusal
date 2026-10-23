@@ -18,7 +18,7 @@ Some primary models decline legitimate work, such as security research, penetrat
 
 - Hermes `>= 0.22.1` (the `requires_hermes` floor in `plugin.yaml`)
 - Python `>= 3.10`
-- At least one entry in `fallback_models`. Without one, a detected refusal ends the turn (see [Behavior and disclosures](#behavior-and-disclosures)).
+- At least one entry in `fallback_providers`. Without one, a detected refusal ends the turn (see [Behavior and disclosures](#behavior-and-disclosures)).
 
 ## Installation
 
@@ -43,12 +43,16 @@ hermes plugins capabilities refusal
 
 ## Configuration
 
-The plugin has no settings of its own. Configure the fallback chain in `~/.hermes/config.yaml`:
+The plugin has no settings of its own. Configure the fallback chain in `~/.hermes/config.yaml` (or with `hermes fallback add`):
 
 ```yaml
-model: openrouter/google/gemini-2.0-flash-001
-fallback_models:
-  - anthropic/claude-3-5-haiku-20241022
+model:
+  default: gemini-3.8-flash
+  provider: openrouter
+
+fallback_providers:
+  - provider: anthropic
+    model: claude-haiku-4-5
 ```
 
 ## How it works
@@ -66,7 +70,7 @@ Hermes does not let plugins register custom failover reasons, so a detected refu
 - **Every turn is inspected.** The middleware reads each model response before the agent loop uses it. Nothing is stored or sent anywhere.
 - **Responses are modified.** A detected refusal changes the response metadata (`finish_reason`, `stop_reason`) so that Hermes triggers failover.
 - **Fallback costs tokens.** Hermes resends the full conversation to the fallback model, and the fallback provider bills for it.
-- **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback model.
+- **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback provider.
 - The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package and stores no credentials.
 
 ## Library usage
