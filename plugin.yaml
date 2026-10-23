@@ -1,0 +1,19 @@
+name: refusal
+label: Refusal
+version: 0.1.0
+description: Detects model refusals and deflections and retries the turn on a fallback model
+author: 0ldev
+license: MIT
+homepage: https://github.com/0ldev/refusal
+tags:
+  - fallback
+  - safety
+  - refusal
+  - routing
+requires_hermes: ">=0.22.1"
+capabilities: []
+provides_middleware:
+  - llm_execution
+provides_tools: []
+provides_hooks: []
+requires_env: []
