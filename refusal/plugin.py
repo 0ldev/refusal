@@ -1,15 +1,24 @@
-"""llm_execution middleware that routes refusals into Hermes provider fallback."""
+"""llm_execution middleware that routes refusals into Hermes provider fallback,
+plus the jailbreak kernel that pre-prompts the fallback retry."""
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from . import kernel
 from .detector import DetectionResult, RefusalDetector
 
 logger = logging.getLogger(__name__)
 
 _detector = RefusalDetector()
+
+#: Per-session kernel arming level (0 = unarmed). A detected refusal raises the
+#: level by one (capped at kernel.MAX_LEVEL); the llm_request middleware injects
+#: the active kernel text into the system message of every request for an armed
+#: session, so the fallback retry carries the preprompt.
+_armed: dict[str, int] = {}
 
 
 def _has_tool_calls(response: Any) -> bool:
@@ -156,6 +165,58 @@ def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
         setattr(response, "incomplete_details", {"reason": "content_filter"})
 
 
+def _jailbreak_enabled() -> bool:
+    """Kill switch: REFUSAL_JAILBREAK=0 disables kernel arming/injection.
+
+    Read at call time so the switch works without a restart. Detection and
+    fallback routing are unaffected.
+    """
+    return os.environ.get("REFUSAL_JAILBREAK", "1").strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _session_id_from_context(kwargs: Any) -> str:
+    """Best-effort session id from middleware context (empty when unavailable)."""
+    return str(kwargs.get("session_id") or "")
+
+
+def _arm_session(session_id: str) -> int:
+    """Raise the session's kernel level by one (capped) and return the new level."""
+    level = min(_armed.get(session_id, 0) + 1, kernel.MAX_LEVEL)
+    _armed[session_id] = level
+    return level
+
+
+def on_llm_request(request: Any, **context: Any) -> dict:
+    """Append the armed kernel to the system message of outgoing requests.
+
+    Runs before every provider call. Requests for unarmed sessions (level 0)
+    pass through untouched, so a turn's first call is made without the
+    preprompt and a refusal on it is genuine. Fail-soft: any error returns the
+    request unchanged.
+    """
+    if not isinstance(request, dict):
+        return {"request": request}
+    try:
+        if _jailbreak_enabled():
+            session_id = _session_id_from_context(context)
+            level = _armed.get(session_id, 0)
+            if session_id and level >= 1:
+                new_messages, changed = kernel.inject_kernel(
+                    request.get("messages"), kernel.kernel_text(level)
+                )
+                if changed:
+                    new_request = dict(request)
+                    new_request["messages"] = new_messages
+                    logger.info(
+                        "jailbreak kernel injected (session=%s level=%d model=%s)",
+                        session_id, level, context.get("model"),
+                    )
+                    return {"request": new_request}
+    except Exception as exc:
+        logger.warning("refusal llm_request middleware error (fail-soft): %s", exc)
+    return {"request": request}
+
+
 def on_llm_execution(**kwargs: Any) -> Any:
     """Run the model call, then flag refusals as content_filter to trigger fallback."""
     next_call = kwargs.get("next_call")
@@ -172,13 +233,18 @@ def on_llm_execution(**kwargs: Any) -> Any:
     if text:
         detection = _detector.detect(text)
         if detection.is_refusal:
+            session_id = _session_id_from_context(kwargs)
+            if session_id and _jailbreak_enabled():
+                level = _arm_session(session_id)
+                logger.info("jailbreak armed for session %s (level=%d)", session_id, level)
             _mark_as_refusal(response, detection)
 
     return response
 
 
 def register(ctx: Any) -> None:
-    """Register the llm_execution middleware with Hermes."""
+    """Register the llm_execution and llm_request middlewares with Hermes."""
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware("llm_execution", on_llm_execution)
-        logger.info("refusal registered as llm_execution middleware")
+        ctx.register_middleware("llm_request", on_llm_request)
+        logger.info("refusal registered as llm_execution + llm_request middleware")

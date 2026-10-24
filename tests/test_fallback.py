@@ -12,6 +12,7 @@ from refusal.plugin import (
     _has_tool_calls,
     _mark_as_refusal,
     on_llm_execution,
+    on_llm_request,
     register,
 )
 
@@ -182,7 +183,10 @@ class TestPluginRegistration:
     def test_register_adds_middleware(self):
         ctx = MagicMock()
         register(ctx)
-        ctx.register_middleware.assert_called_once_with("llm_execution", on_llm_execution)
+        assert ctx.register_middleware.call_count == 2
+        calls = {c.args[0]: c.args[1] for c in ctx.register_middleware.call_args_list}
+        assert calls["llm_execution"] is on_llm_execution
+        assert calls["llm_request"] is on_llm_request
 
 
 class TestPackageEntrypointExport:
@@ -192,6 +196,8 @@ class TestPackageEntrypointExport:
         assert callable(pkg.register)
         assert hasattr(pkg, "on_llm_execution")
         assert callable(pkg.on_llm_execution)
+        assert hasattr(pkg, "on_llm_request")
+        assert callable(pkg.on_llm_request)
 
 
 class TestLoaderImportWithoutSysPath:
