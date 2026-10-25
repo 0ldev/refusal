@@ -76,13 +76,21 @@ plugins:
     refusal:
       settings:
         preprompt: "<text appended to the system prompt after a refusal>"
-        preprompt_escalated: "<optional: used instead after a second refusal in the session>"
+        preprompt_escalated: "<optional: used instead after the preprompt itself was refused>"
+        on_preprompt_refusal: disarm      # disarm | escalate | keep
+        preprompt_scope: turn             # turn | session
+        preprompt_models: []              # e.g. ["google/gemini-*"]; empty = any model
+        max_armed_sessions: 1024
 ```
 
 - **Nothing is bundled.** Both settings default to empty, and with `preprompt` empty requests are never modified. `preprompt_escalated` falls back to `preprompt` when empty.
-- **Detection arms the session.** A detected refusal raises the session's level (1, then 2) before the response is marked `content_filter`. An `llm_request` middleware appends the text for the current level to the system prompt of every later request in that session. The first call of a turn in an unarmed session is untouched.
+- **Detection arms the session.** A refusal on a request that did not carry the preprompt sets the session to level 1. An `llm_request` middleware then appends the text for the current level to the system prompt of later requests, including the fallback retry. The first call of a turn in an unarmed session is untouched.
 - **Per-provider injection.** The text goes where the provider reads its system prompt: the `system` message for chat completions, the top-level `system` field for Anthropic and Bedrock, and `instructions` for Responses/Codex.
-- **Session-scoped.** The armed state persists for the session: once a model refuses, later turns keep the preprompt. It is forgotten on `on_session_finalize` and `on_session_reset`, and at most `max_armed_sessions` sessions are tracked (default 1024; least recently armed evicted first). A false-positive detection arms the session too.
+- **When the preprompt is refused too** (`on_preprompt_refusal`, default `disarm`): `disarm` stops sending it for the session, `escalate` switches to `preprompt_escalated` (or `preprompt` if empty), and `keep` leaves the level alone. Hermes moves on to the next fallback entry in every case, and the plugin logs `refused despite preprompt` at WARNING. A refusal from a model the preprompt was not sent to does not count.
+- **Scope** (`preprompt_scope`, default `turn`): with `turn` the armed level is forgotten when the next turn starts, so a false positive or a failed preprompt does not follow the session. With `session` it lasts until the session ends. Without a `turn_id` in the middleware context, `turn` behaves like `session`.
+- **Which models** (`preprompt_models`): glob patterns matched against `model` or `provider/model`, case-insensitively. When set, the preprompt is only sent to matching models, so a final backup on another vendor never receives it.
+- **Cleanup.** Armed state is forgotten on `on_session_finalize` and `on_session_reset`, and at most `max_armed_sessions` sessions are tracked (default 1024; least recently armed evicted first).
+- **Observability.** Injected requests carry `source: refusal` and a `reason` in Hermes's middleware trace. The plugin logs arming, injection, `answered with preprompt` and `refused despite preprompt`.
 - **Kill switch.** `REFUSAL_PREPROMPT=0` disables arming and injection regardless of the settings (read at call time). Detection and fallback routing still work.
 - **Your responsibility.** What you put in the preprompt is sent to your model provider, and you are responsible for complying with that provider's usage policy.
 

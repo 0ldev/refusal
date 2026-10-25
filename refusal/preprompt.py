@@ -88,3 +88,28 @@ def inject_into_request(request: Any, text: str, api_mode: str = "") -> Tuple[An
     new_request = dict(request)
     new_request["messages"] = new_messages
     return new_request, True
+
+
+def _strings(value: Any) -> List[str]:
+    """Every string reachable inside nested dicts/lists (message content, system blocks)."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [t for v in value.values() for t in _strings(v)]
+    if isinstance(value, (list, tuple)):
+        return [t for v in value for t in _strings(v)]
+    return []
+
+
+def request_contains(request: Any, text: str) -> bool:
+    """True when ``text`` appears in the request's system prompt (any provider shape)."""
+    if not isinstance(request, dict) or not text:
+        return False
+    for key in ("system", "instructions"):
+        if any(text in chunk for chunk in _strings(request.get(key))):
+            return True
+    for msg in request.get("messages") or ():
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            if any(text in chunk for chunk in _strings(msg.get("content"))):
+                return True
+    return False

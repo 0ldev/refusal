@@ -39,6 +39,16 @@ def _request():
     }
 
 
+def _round(session_id, response=None, **ctx):
+    """One model call: request middleware, then the execution middleware over the effective request."""
+    effective = on_llm_request(_request(), session_id=session_id, **ctx)["request"]
+    out = on_llm_execution(
+        next_call=lambda req: response if response is not None else _refusal_response(),
+        request=effective, session_id=session_id, **ctx,
+    )
+    return effective, out
+
+
 @pytest.fixture(autouse=True)
 def _clear_armed_state(monkeypatch):
     monkeypatch.delenv("REFUSAL_PREPROMPT", raising=False)
@@ -103,12 +113,10 @@ class TestArmingState:
         on_llm_execution(next_call=next_call, request={"messages": []}, session_id="s1")
         assert _armed["s1"] == 1
 
-    def test_repeated_refusals_cap_at_max_level(self):
-        def next_call(req):
-            return _refusal_response()
-
-        for _ in range(3):
-            on_llm_execution(next_call=next_call, request={"messages": []}, session_id="s1")
+    def test_repeated_refusals_cap_at_max_level(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "escalate")
+        for _ in range(4):
+            _round("s1")
         assert _armed["s1"] == preprompt.MAX_LEVEL
 
     def test_sessions_are_isolated(self):
@@ -220,12 +228,10 @@ class TestEndToEndFlow:
         system = retry["request"]["messages"][0]["content"]
         assert LEVEL_ONE in system
 
-    def test_double_refusal_escalates_to_max(self):
-        def next_call(req):
-            return _refusal_response()
-
-        on_llm_execution(next_call=next_call, request=_request(), session_id="s1")  # -> core
-        on_llm_execution(next_call=next_call, request=_request(), session_id="s1")  # -> max
+    def test_double_refusal_escalates_to_max(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "escalate")
+        _round("s1")  # bare refusal -> level 1
+        _round("s1")  # refused despite level-1 text -> level 2
         retry = on_llm_request(_request(), session_id="s1")
         system = retry["request"]["messages"][0]["content"]
         assert LEVEL_TWO in system
@@ -322,3 +328,104 @@ class TestSessionLifecycle:
             plugin.register(ctx)
             assert plugin._max_armed_sessions == expected
         plugin._max_armed_sessions = plugin.DEFAULT_MAX_ARMED_SESSIONS
+
+
+def _system(req):
+    return req["messages"][0]["content"]
+
+
+class TestRefusedDespitePreprompt:
+    def test_disarm_is_the_default_and_stops_sending(self, caplog):
+        eff, _ = _round("s1")
+        assert LEVEL_ONE not in _system(eff) and _armed["s1"] == 1
+        with caplog.at_level("WARNING"):
+            eff, _ = _round("s1")
+        assert LEVEL_ONE in _system(eff)  # this call carried it and was refused
+        assert "s1" not in _armed
+        assert any("refused despite preprompt" in r.message for r in caplog.records)
+        eff, _ = _round("s1")
+        assert LEVEL_ONE not in _system(eff)
+
+    def test_escalate_mode(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "escalate")
+        _round("s1"); _round("s1")
+        assert _armed["s1"] == 2
+        assert LEVEL_TWO in _system(_round("s1")[0])
+
+    def test_keep_mode(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "keep")
+        _round("s1"); _round("s1"); _round("s1")
+        assert _armed["s1"] == 1
+
+    def test_refusal_on_excluded_model_is_not_a_preprompt_refusal(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_models", ("google/*",))
+        _armed["s1"] = 1
+        eff, _ = _round("s1", provider="anthropic", model="claude-x")
+        assert LEVEL_ONE not in _system(eff)
+        assert _armed["s1"] == 1  # neither disarmed nor escalated
+
+    def test_success_with_preprompt_is_logged(self, caplog):
+        _armed["s1"] = 1
+        with caplog.at_level("INFO"):
+            _round("s1", response=_benign_response())
+        assert any("answered with preprompt" in r.message for r in caplog.records)
+        assert _armed["s1"] == 1
+
+
+class TestScope:
+    def test_turn_scope_forgets_on_next_turn(self):
+        _round("s1", turn_id="t1")
+        same = on_llm_request(_request(), session_id="s1", turn_id="t1")["request"]
+        assert LEVEL_ONE in _system(same)
+        nxt = on_llm_request(_request(), session_id="s1", turn_id="t2")["request"]
+        assert LEVEL_ONE not in _system(nxt)
+        assert "s1" not in _armed
+
+    def test_session_scope_keeps_across_turns(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_scope", "session")
+        _round("s1", turn_id="t1")
+        nxt = on_llm_request(_request(), session_id="s1", turn_id="t2")["request"]
+        assert LEVEL_ONE in _system(nxt)
+
+
+class TestModelAllowlist:
+    @pytest.mark.parametrize("patterns,provider,model,allowed", [
+        ((), "x", "y", True),
+        (("google/gemini-*",), "google", "gemini-3.8-flash", True),
+        (("google/gemini-*",), "openrouter", "gemini-3.8-flash", False),
+        (("gemini-*",), "openrouter", "Gemini-3.8-Flash", True),
+        (("google/*",), "anthropic", "claude", False),
+    ])
+    def test_matching(self, monkeypatch, patterns, provider, model, allowed):
+        monkeypatch.setattr(plugin_mod, "_models", patterns)
+        _armed["s1"] = 1
+        out = on_llm_request(_request(), session_id="s1", provider=provider, model=model)["request"]
+        assert (LEVEL_ONE in _system(out)) is allowed
+
+    def test_settings_parsing(self):
+        from unittest.mock import MagicMock
+
+        ctx = MagicMock()
+        values = {"preprompt_models": " Google/Gemini-* , ,foo", "on_preprompt_refusal": "ESCALATE",
+                  "preprompt_scope": "bogus"}
+        ctx.get_config.side_effect = lambda key, default=None: values.get(key, default)
+        plugin_mod.register(ctx)
+        try:
+            assert plugin_mod._models == ("google/gemini-*", "foo")
+            assert plugin_mod._on_preprompt_refusal == "escalate"
+            assert plugin_mod._scope == "turn"  # invalid value -> default
+        finally:
+            plugin_mod._models, plugin_mod._on_preprompt_refusal, plugin_mod._scope = (), "disarm", "turn"
+
+
+class TestObservability:
+    def test_trace_fields_on_injection(self):
+        _armed["s1"] = 1
+        result = on_llm_request(_request(), session_id="s1")
+        assert result["source"] == "refusal" and "level 1" in result["reason"]
+
+    def test_no_session_id_logs_and_does_not_arm(self, caplog):
+        with caplog.at_level("INFO"):
+            on_llm_execution(next_call=lambda r: _refusal_response(), request=_request())
+        assert _armed == {}
+        assert any("without a session_id" in r.message for r in caplog.records)

@@ -30,6 +30,23 @@ config_schema:
     default: ""
     label: Escalated retry preprompt
     description: "Optional text used instead of the preprompt once a second refusal is detected in the same session"
+  on_preprompt_refusal:
+    type: str
+    choices: [disarm, escalate, keep]
+    default: disarm
+    label: When the preprompt is refused too
+    description: "disarm stops sending the preprompt for the session, escalate switches to preprompt_escalated, keep leaves the level unchanged. Hermes still moves on to the next fallback entry in every case"
+  preprompt_scope:
+    type: str
+    choices: [turn, session]
+    default: turn
+    label: Preprompt scope
+    description: "turn forgets the armed level when the next turn starts; session keeps it until the session ends or is reset"
+  preprompt_models:
+    type: list
+    default: []
+    label: Models that may receive the preprompt
+    description: "Glob patterns matched against model or provider/model (for example google/gemini-*). Empty allows any model"
   max_armed_sessions:
     type: int
     default: 1024
