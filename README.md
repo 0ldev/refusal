@@ -211,8 +211,8 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 - **Streaming.** The middleware sees the finished response, so a refusal that streamed to the user is still shown before the fallback runs.
 - **Sub-agents** have their own session ids and are armed independently of their parent.
 - **Auxiliary calls** (compression, titles) never pass through the request middleware and are unaffected.
-- **Prompt caching.** On Anthropic, arming adds a small uncached block after the cached system prefix. In a live test with an ~8.6k-token cached system prompt, the first armed request wrote 21 new cache tokens and read the rest from cache; the cached prefix stayed warm. Long histories with several message-level cache breakpoints were not measured.
-- **Tested against.** Anthropic (live, OAuth, `claude-haiku-4-5`). The OpenAI-compatible, Bedrock and Responses/Codex request shapes are covered by unit tests only.
+- **Prompt caching (Anthropic).** The preprompt is added as a new block after the cached system prefix, so the first request after arming cannot reuse the cached message history. Measured live on `claude-haiku-4-5` with an ~11k-token prompt (system plus 10 turns, 4 cache markers): the first armed request re-wrote 6,291 tokens and still read the 5,055-token system prefix from cache; later armed requests read all ~11.3k tokens from cache, history growth cost only the new turn (~635 tokens written), and disarming read the original cache again while it was still within its TTL. So arming costs one re-write of the history region, once per level change. With a short history there is almost nothing to re-write (21 tokens in an ~8.6k-token system-prompt-only test).
+- **Tested against.** Live: Anthropic (`claude-haiku-4-5`, OAuth) and OpenRouter chat completions (`poolside/laguna-s-2.1:free`: a real refusal-shaped reply was marked `content_filter`, armed the session, and the next request carried the text in a single system message). The Bedrock and Responses/Codex request shapes are covered by unit tests only.
 
 ## Upgrading from 0.1.x
 

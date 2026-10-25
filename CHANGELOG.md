@@ -23,6 +23,9 @@
 - Session cleanup on `on_session_reset` used the new session id; it now drops the old one (`old_session_id`) as well as the finalizing one.
 - Post-call processing in `on_llm_execution` is fail-soft: an internal error is logged and the response is returned unchanged.
 
+### Verified
+- Live on Anthropic (`claude-haiku-4-5`) and OpenRouter chat completions (free model): arming from a real response, injection into the right field, model compliance, and prompt-cache behavior with a long history. Persistence through Hermes's real `ctx.state` across two processes.
+
 ### Changed
 - Docs: full settings reference, lifecycle, outcome table, log reference, limitations.
 
