@@ -337,6 +337,39 @@ def _disarm_session(session_id: str = "", old_session_id: str = "", **_: Any) ->
             _disarmed_turns.pop(str(sid), None)
 
 
+def _on_session_delete(session_id: str = "", deleted_ids: Any = None, **_: Any) -> None:
+    """Forget deleted or archived sessions (``on_session_delete``; Hermes 0.22.4+)."""
+    ids = [session_id] + [d for d in (deleted_ids if isinstance(deleted_ids, (list, tuple)) else ()) if d]
+    for sid in ids:
+        if sid:
+            _set_level(str(sid), 0)
+            _disarmed_turns.pop(str(sid), None)
+
+
+def _on_compaction(session_id: str = "", old_session_id: str = "", **_: Any) -> None:
+    """Carry an armed level over when compaction rotates the session id (``post_compaction``; 0.22.4+).
+
+    ``old_session_id`` is empty when the transcript was compacted in place, in which case the id
+    did not change and there is nothing to move.
+    """
+    old, new = str(old_session_id or ""), str(session_id or "")
+    if not old or not new or old == new:
+        return
+    with _armed_lock:
+        # A disarm made earlier in this turn must also hold for the session's new id.
+        if old in _disarmed_turns:
+            _disarmed_turns[new] = _disarmed_turns.pop(old)
+        _refresh_locked()
+        level = _armed.get(old, 0)
+        if not level:
+            return
+        turn = _armed_turns.get(old, "")
+        _set_level_locked(old, 0)
+        _set_level_locked(new, max(level, _armed.get(new, 0)), turn)
+        _flush_locked()
+    logger.info("preprompt level %d carried over a compaction (%s -> %s)", level, old, new)
+
+
 def _model_allowed(context: Any) -> bool:
     """True when the request's provider/model matches ``preprompt_models`` (empty list = any)."""
     if not _models:
@@ -549,7 +582,7 @@ def _setting_models(ctx: Any) -> tuple[str, ...]:
 
 
 def register(ctx: Any) -> None:
-    """Register the middlewares and the session-cleanup hooks with Hermes."""
+    """Register the middlewares and the session-lifecycle hooks with Hermes."""
     global _texts, _max_armed_sessions, _on_preprompt_refusal, _scope, _models, _arm_on_native, _persist, _state
     _texts = (_setting_text(ctx, "preprompt"), _setting_text(ctx, "preprompt_escalated"))
     _max_armed_sessions = _setting_max_sessions(ctx)
@@ -567,5 +600,8 @@ def register(ctx: Any) -> None:
         ctx.register_middleware("llm_request", on_llm_request)
         logger.info("refusal registered as llm_execution + llm_request middleware")
     if hasattr(ctx, "register_hook"):
-        for hook in ("on_session_finalize", "on_session_reset"):
-            ctx.register_hook(hook, _disarm_session)
+        ctx.register_hook("on_session_finalize", _disarm_session)
+        ctx.register_hook("on_session_reset", _disarm_session)
+        # Hermes 0.22.4+ only: older versions log "unknown hook" for these two and never call them.
+        ctx.register_hook("on_session_delete", _on_session_delete)
+        ctx.register_hook("post_compaction", _on_compaction)

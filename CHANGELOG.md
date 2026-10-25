@@ -16,6 +16,7 @@
 - Softer refusal phrasings ("I'm not comfortable providing that", "I'd rather not walk you through that", "that falls outside what I can help with", …).
 
 ### Fixed
+- Armed state no longer resets when context compression rotates the session id: `post_compaction` (Hermes 0.22.4+) carries the level, and a same-turn disarm, to the new id. `on_session_delete` drops deleted or archived sessions. On older Hermes both hooks are unknown and only produce a startup warning.
 - Message content returned as a list of text parts (`[{"type": "text", "text": …}]`) was handed to the detector as a list, so a refusal in that shape was silently missed. Content is now flattened to text first.
 - A request that already carries the configured preprompt is never injected a second time.
 - Explained technical inability ("I can't run that because the container has no network", "The repository is read-only") is no longer treated as a refusal unless the same stretch mentions policy or harm.

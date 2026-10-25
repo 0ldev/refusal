@@ -320,7 +320,7 @@ class TestSessionLifecycle:
         ctx.get_config.side_effect = lambda key, default=None: values.get(key, default)
         plugin.register(ctx)
         hooks = {c.args[0] for c in ctx.register_hook.call_args_list}
-        assert hooks == {"on_session_finalize", "on_session_reset"}
+        assert hooks == {"on_session_finalize", "on_session_reset", "on_session_delete", "post_compaction"}
         assert plugin._texts == ("one", "two")
         ctx.get_config.side_effect = None
         ctx.get_config.return_value = MagicMock()  # not a string -> feature off
@@ -702,3 +702,48 @@ class TestDisarmIsStickyWithinATurn:
         self._arm_then_fail_with_preprompt("t1")
         plugin_mod._disarm_session(session_id="s1")
         assert "s1" not in plugin_mod._disarmed_turns
+
+
+class TestCompactionAndDelete:
+    def test_compaction_carries_the_level_to_the_new_session(self):
+        _armed["old"] = 2
+        plugin_mod._armed_turns["old"] = "t1"
+        plugin_mod._on_compaction(session_id="new", old_session_id="old", kind="summarize", reason="pre_api")
+        assert "old" not in _armed and _armed["new"] == 2 and plugin_mod._armed_turns["new"] == "t1"
+        assert LEVEL_TWO in _system(_mw(_request(), session_id="new", turn_id="t1")["request"])
+
+    def test_in_place_compaction_changes_nothing(self):
+        _armed["s1"] = 1
+        plugin_mod._on_compaction(session_id="s1", old_session_id="", kind="micro_summarize")
+        plugin_mod._on_compaction(session_id="s1", old_session_id="s1")
+        assert _armed == {"s1": 1}
+
+    def test_compaction_of_an_unarmed_session_arms_nothing(self):
+        plugin_mod._on_compaction(session_id="new", old_session_id="old")
+        assert _armed == {}
+
+    def test_compaction_keeps_the_higher_level_if_the_new_id_is_already_armed(self):
+        _armed.update({"old": 1, "new": 2})
+        plugin_mod._on_compaction(session_id="new", old_session_id="old")
+        assert _armed == {"new": 2}
+
+    def test_compaction_survives_with_persistence(self, persisted):
+        plugin_mod._arm_session("old", "t1")
+        plugin_mod._on_compaction(session_id="new", old_session_id="old")
+        assert persisted.data["armed"] == [["new", 1, "t1"]]
+
+    def test_session_delete_drops_the_session_and_any_deleted_ids(self):
+        _armed.update({"a": 1, "b": 1, "c": 1, "keep": 1})
+        plugin_mod._on_session_delete(session_id="a", reason="delete", profile="default", deleted_ids=["b", "c"])
+        assert _armed == {"keep": 1}
+        plugin_mod._on_session_delete(session_id="missing", deleted_ids="not-a-list")
+        plugin_mod._on_session_delete()
+        assert _armed == {"keep": 1}
+
+
+    def test_compaction_and_delete_keep_the_same_turn_disarm_marker_in_step(self):
+        plugin_mod._disarmed_turns["old"] = "t1"
+        plugin_mod._on_compaction(session_id="new", old_session_id="old")
+        assert plugin_mod._disarmed_turns == {"new": "t1"}
+        plugin_mod._on_session_delete(session_id="new")
+        assert plugin_mod._disarmed_turns == {}
