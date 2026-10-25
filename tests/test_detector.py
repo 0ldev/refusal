@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import time
 
 from refusal import DetectionResult, RefusalDetector, detect, is_refusal
 
@@ -381,6 +382,10 @@ GENUINE_ANSWERS_WITH_REFUSAL_LIKE_WORDING = [
     "As an AI, I can't browse the web, but the docs say the flag is --force.",
     "Sorry, I can't reproduce this on Linux; it works for me with kernel 6.1.",
     "This request violates the rate limit; retry after 60 seconds.",
+    "I'm not comfortable writing to the production database without a backup, so I made a copy first.",
+    "I don't feel comfortable guessing the API version; can you confirm which one you use?",
+    "I have to say no to that flag: it was removed in v3. Use --output instead.",
+    "I must say no to this option; it conflicts with --strict.",
 ]
 
 
@@ -394,3 +399,38 @@ class TestUncommonRefusalPhrasings:
     @pytest.mark.parametrize("text", GENUINE_ANSWERS_WITH_REFUSAL_LIKE_WORDING)
     def test_genuine_answer_not_flagged(self, text):
         assert is_refusal(text) is False
+
+
+class TestPatternTimingBounds:
+    """Regression tests for catastrophic-backtracking spans in patterns.py: a degenerate
+    reply must not stall the synchronous llm_execution middleware for seconds."""
+
+    def test_long_whitespace_run_does_not_stall(self):
+        text = "i cannot " + " " * 50_000
+        start = time.monotonic()
+        detect(text)
+        assert time.monotonic() - start < 0.5
+
+    def test_repeated_decline_line_does_not_stall(self):
+        text = "i cannot write " * 4000
+        start = time.monotonic()
+        detect(text)
+        assert time.monotonic() - start < 0.5
+
+    @pytest.mark.parametrize("run", ["\n", " \n", " ", "\t", "\u00a0", "\u3000"])
+    def test_whitespace_run_inside_a_reply_does_not_stall(self, run):
+        # Trailing whitespace is stripped by the detector; a run in the middle is not.
+        for text in ("hello " + run * 20_000 + "x", "i cannot " + run * 20_000 + "x"):
+            start = time.monotonic()
+            detect(text)
+            assert time.monotonic() - start < 0.5
+
+    def test_sentence_start_prefix_is_bounded(self):
+        # (?:^|[.!?\n]\s{0,20}) must stay linear on long punctuation/newline runs.
+        for text in ("a.\n" * 15_000 + "x", "\n" * 40_000 + "i cannot help with that"):
+            start = time.monotonic()
+            detect(text)
+            assert time.monotonic() - start < 0.5
+
+    def test_decline_after_blank_lines_is_still_detected(self):
+        assert is_refusal("Here you go.\n\n\n\nI cannot help with that request.")
