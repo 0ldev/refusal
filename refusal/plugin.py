@@ -48,6 +48,11 @@ _models: tuple[str, ...] = ()
 #: turn_id in which each armed session was last armed (for ``turn`` scope).
 _armed_turns: dict[str, str] = {}
 
+#: turn_id in which a session was last disarmed after refusing despite the preprompt, so a later
+#: refusal in that same turn (a second fallback, a tool-loop retry) does not arm it again.
+#: Process-local; only effective when Hermes supplies a turn_id.
+_disarmed_turns: dict[str, str] = {}
+
 #: Also arm on provider-signalled refusals (``stop_reason=refusal``, ``finish_reason=content_filter``),
 #: which carry no matchable text. Hermes falls back on these by itself.
 _arm_on_native = True
@@ -110,6 +115,23 @@ def _has_tool_calls(response: Any) -> bool:
     return False
 
 
+def _content_to_text(content: Any) -> str:
+    """Flatten message content: a string, or a list of text parts/blocks (OpenAI parts, Anthropic blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return " \n".join(parts)
+    return ""
+
+
 def _extract_text_from_response(response: Any) -> str:
     """Extract assistant text content from various response shapes (OpenAI, SimpleNamespace, dict, Anthropic)."""
     if response is None:
@@ -124,11 +146,11 @@ def _extract_text_from_response(response: Any) -> str:
             choice = choices[0]
             msg = choice.get("message")
             if isinstance(msg, dict):
-                return msg.get("content") or ""
+                return _content_to_text(msg.get("content"))
             if isinstance(msg, str):
                 return msg
-            return choice.get("text") or ""
-        return response.get("content") or ""
+            return _content_to_text(choice.get("text"))
+        return _content_to_text(response.get("content"))
 
     choices = getattr(response, "choices", None)
     if choices and len(choices) > 0:
@@ -137,39 +159,43 @@ def _extract_text_from_response(response: Any) -> str:
         if message is not None:
             content = getattr(message, "content", None)
             if content is not None:
-                return content
+                return _content_to_text(content)
             if isinstance(message, dict):
-                return message.get("content") or ""
+                return _content_to_text(message.get("content"))
         choice_text = getattr(choice, "text", None)
         if choice_text is not None:
-            return choice_text
+            return _content_to_text(choice_text)
         if isinstance(choice, dict):
-            return choice.get("text") or ""
+            return _content_to_text(choice.get("text"))
 
-    content = getattr(response, "content", None)
-    if content is not None and isinstance(content, str):
-        return content
-
-    if hasattr(response, "content") and isinstance(response.content, list):
-        parts: list[str] = []
-        for block in response.content:
-            if hasattr(block, "text") and block.text:
-                parts.append(block.text)
-            elif isinstance(block, dict) and block.get("text"):
-                parts.append(block["text"])
-        if parts:
-            return " \n".join(parts)
-
-    return ""
+    return _content_to_text(getattr(response, "content", None))
 
 
-def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
-    """Mark the response as content-filtered so Hermes activates its fallback model."""
+def _mark_as_refusal(response: Any, detection: DetectionResult, kwargs: Any) -> None:
+    """Mark the response as content-filtered so Hermes activates its fallback model.
+
+    Hermes logs every content_filter response identically — ``reason=content_policy_blocked``,
+    ``error_type=ContentPolicyBlocked`` — whether the provider actually signalled a refusal or a
+    plugin like this one synthesized it (see agent/turn_truncation.py). There is no field that
+    tells the two apart downstream, so this line carries the same correlation keys Hermes's own
+    native log line prints (session, model, provider, api_request_id) — the only way an operator
+    can join the two lines and know which content_policy_blocked events were ours, not the
+    provider's. Hermes-agent issue #138900 asked for a public seam to do this properly (a
+    registered failover reason distinct from content_policy_blocked); it was closed once this
+    plugin shipped the finish_reason mutation as a workaround, without the seam landing.
+    """
     logger.warning(
-        "Refusal detected (kind=%s, reason=%s, text=%s) — mutating response to content_filter to trigger fallback",
+        "Refusal detected (kind=%s, reason=%s, text=%s, session=%s, model=%s, provider=%s, "
+        "api_request_id=%s) — mutating response to content_filter to trigger fallback; this is a "
+        "plugin-synthesized refusal, not a provider signal, but Hermes will log and count it "
+        "identically to one (content_policy_blocked/ContentPolicyBlocked)",
         detection.kind,
         detection.reason,
         detection.matched_text,
+        kwargs.get("session_id") or "",
+        kwargs.get("model") or "",
+        kwargs.get("provider") or "",
+        kwargs.get("api_request_id") or "",
     )
 
     if isinstance(response, dict):
@@ -326,6 +352,40 @@ def _disarm_session(session_id: str = "", old_session_id: str = "", **_: Any) ->
     for sid in (session_id, old_session_id):
         if sid:
             _set_level(str(sid), 0)
+            _disarmed_turns.pop(str(sid), None)
+
+
+def _on_session_delete(session_id: str = "", deleted_ids: Any = None, **_: Any) -> None:
+    """Forget deleted or archived sessions (``on_session_delete``; Hermes 0.22.3+)."""
+    ids = [session_id] + [d for d in (deleted_ids if isinstance(deleted_ids, (list, tuple)) else ()) if d]
+    for sid in ids:
+        if sid:
+            _set_level(str(sid), 0)
+            _disarmed_turns.pop(str(sid), None)
+
+
+def _on_compaction(session_id: str = "", old_session_id: str = "", **_: Any) -> None:
+    """Carry an armed level over when compaction rotates the session id (``post_compaction``; Hermes 0.22.3+).
+
+    ``old_session_id`` is empty when the transcript was compacted in place, in which case the id
+    did not change and there is nothing to move.
+    """
+    old, new = str(old_session_id or ""), str(session_id or "")
+    if not old or not new or old == new:
+        return
+    with _armed_lock:
+        # A disarm made earlier in this turn must also hold for the session's new id.
+        if old in _disarmed_turns:
+            _disarmed_turns[new] = _disarmed_turns.pop(old)
+        _refresh_locked()
+        level = _armed.get(old, 0)
+        if not level:
+            return
+        turn = _armed_turns.get(old, "")
+        _set_level_locked(old, 0)
+        _set_level_locked(new, max(level, _armed.get(new, 0)), turn)
+        _flush_locked()
+    logger.info("preprompt level %d carried over a compaction (%s -> %s)", level, old, new)
 
 
 def _model_allowed(context: Any) -> bool:
@@ -372,9 +432,10 @@ def on_llm_request(request: Any, **context: Any) -> dict | None:
         if _preprompt_enabled():
             session_id = _session_id_from_context(context)
             level = _current_level(session_id, str(context.get("turn_id") or "")) if session_id else 0
-            if level >= 1 and _model_allowed(context):
+            text = preprompt.preprompt_text(level, _texts)
+            if level >= 1 and _model_allowed(context) and not preprompt.request_contains(request, text):
                 new_request, changed = preprompt.inject_into_request(
-                    request, preprompt.preprompt_text(level, _texts), str(context.get("api_mode") or "")
+                    request, text, str(context.get("api_mode") or "")
                 )
                 if changed:
                     logger.info(
@@ -389,6 +450,17 @@ def on_llm_request(request: Any, **context: Any) -> dict | None:
     except Exception as exc:
         logger.warning("refusal llm_request middleware error (fail-soft): %s", exc)
     return None
+
+
+def _remember_disarm(session_id: str, turn_id: str) -> None:
+    """Note that the session was disarmed in this turn (bounded like the armed table)."""
+    if not turn_id:
+        return
+    with _armed_lock:
+        _disarmed_turns.pop(session_id, None)
+        _disarmed_turns[session_id] = turn_id
+        while len(_disarmed_turns) > _max_armed_sessions:
+            _disarmed_turns.pop(next(iter(_disarmed_turns)))
 
 
 def _handle_refusal(request: Any, kwargs: Any) -> None:
@@ -410,10 +482,13 @@ def _handle_refusal(request: Any, kwargs: Any) -> None:
         elif _on_preprompt_refusal == "disarm":
             new_level = 0
             _set_level(session_id, 0)
+            _remember_disarm(session_id, turn_id)
         else:
             new_level = level
         logger.warning("refused despite preprompt (%s); mode=%s -> level %d",
                        where, _on_preprompt_refusal, new_level)
+    elif level == 0 and turn_id and _disarmed_turns.get(session_id) == turn_id:
+        logger.info("refused again after disarm in this turn (%s); staying disarmed", where)
     elif level == 0:
         logger.info("preprompt armed (%s) -> level %d", where, _arm_session(session_id, turn_id))
     else:
@@ -457,8 +532,9 @@ def _inspect_response(request: Any, response: Any, kwargs: Any) -> None:
         return
     detection = _detector.detect(text)
     if detection.is_refusal:
+        # Mark first: failover must not depend on the optional preprompt bookkeeping.
+        _mark_as_refusal(response, detection, kwargs)
         _handle_refusal(request, kwargs)
-        _mark_as_refusal(response, detection)
     elif _preprompt_enabled() and preprompt.request_contains(
         request, preprompt.preprompt_text(_peek_level(_session_id_from_context(kwargs)) or 1, _texts)
     ):
@@ -524,7 +600,7 @@ def _setting_models(ctx: Any) -> tuple[str, ...]:
 
 
 def register(ctx: Any) -> None:
-    """Register the middlewares and the session-cleanup hooks with Hermes."""
+    """Register the middlewares and the session-lifecycle hooks with Hermes."""
     global _texts, _max_armed_sessions, _on_preprompt_refusal, _scope, _models, _arm_on_native, _persist, _state
     _texts = (_setting_text(ctx, "preprompt"), _setting_text(ctx, "preprompt_escalated"))
     _max_armed_sessions = _setting_max_sessions(ctx)
@@ -542,5 +618,8 @@ def register(ctx: Any) -> None:
         ctx.register_middleware("llm_request", on_llm_request)
         logger.info("refusal registered as llm_execution + llm_request middleware")
     if hasattr(ctx, "register_hook"):
-        for hook in ("on_session_finalize", "on_session_reset"):
-            ctx.register_hook(hook, _disarm_session)
+        ctx.register_hook("on_session_finalize", _disarm_session)
+        ctx.register_hook("on_session_reset", _disarm_session)
+        # Valid hook names from Hermes 0.22.3, which is the requires_hermes floor.
+        ctx.register_hook("on_session_delete", _on_session_delete)
+        ctx.register_hook("post_compaction", _on_compaction)

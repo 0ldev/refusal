@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (develop, unreleased)
+## 0.2.0
 
 ### Added
 - **Retry preprompt (opt-in).** `preprompt` and `preprompt_escalated` settings: user-supplied text appended to the system prompt of requests after a refusal is detected in the session. The plugin ships no text; with `preprompt` empty, requests are never modified.
@@ -15,7 +15,13 @@
 - Logs for arming, injection, `answered with preprompt` and `refused despite preprompt`; `source` / `reason` in Hermes's middleware trace.
 - Softer refusal phrasings ("I'm not comfortable providing that", "I'd rather not walk you through that", "that falls outside what I can help with", …).
 
+### Changed
+- The refusal-detection log line now carries `session`, `model`, `provider` and `api_request_id`. Hermes logs and counts every `content_filter` response identically (`reason=content_policy_blocked`, `error_type=ContentPolicyBlocked`) whether the provider signalled it or this plugin synthesized it from matched text — there's no field downstream that tells the two apart. These keys are the only way to join this line back to Hermes's own native log line and know which `content_policy_blocked` events were ours. See [hermes-agent#138900](https://github.com/NousResearch/hermes-agent/issues/138900) for the public seam this plugin asked for (and that would make this correlation unnecessary) that didn't ship.
+
 ### Fixed
+- Armed state no longer resets when context compression rotates the session id: `post_compaction` carries the level, and a same-turn disarm, to the new id. `on_session_delete` drops deleted or archived sessions.
+- Message content returned as a list of text parts (`[{"type": "text", "text": …}]`) was handed to the detector as a list, so a refusal in that shape was silently missed. Content is now flattened to text first.
+- A request that already carries the configured preprompt is never injected a second time.
 - Explained technical inability ("I can't run that because the container has no network", "The repository is read-only") is no longer treated as a refusal unless the same stretch mentions policy or harm.
 - **Quadratic backtracking on whitespace runs.** The shared sentence-start prefix `(?:^|[.!?\n]\s*)` was still quadratic after 0.1.1: a reply with 5,000 blank lines took ~3 s and 20,000 took ~50 s inside the synchronous middleware. It is now `\s{0,20}` (20,000 blank lines: ~0.1 s). Regression tests added.
 - Two of the new soft patterns flagged ordinary engineering replies ("I'm not comfortable writing to the production database…", "I have to say no to that flag…"); they now require a request-shaped object.
@@ -28,6 +34,7 @@
 
 ### Changed
 - Docs: full settings reference, lifecycle, outcome table, log reference, limitations.
+- `requires_hermes` raised from `>=0.22.1` to `>=0.22.3`, the first release that knows the `on_session_delete` and `post_compaction` hooks (`hermes plugins doctor` rejected them as unknown on 0.22.1 and 0.22.2).
 
 ## 0.1.1
 

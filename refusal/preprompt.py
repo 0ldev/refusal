@@ -39,6 +39,9 @@ def inject_into_messages(messages: Any, text: str) -> Tuple[Any, bool]:
         msg = new_messages[i]
         if isinstance(msg, dict) and msg.get("role") == "system":
             original = msg.get("content")
+            if isinstance(original, list):
+                msg["content"] = [*original, {"type": "text", "text": text}]
+                return new_messages, True
             base = original if isinstance(original, str) else ("" if original is None else str(original))
             msg["content"] = f"{base}\n\n{text}" if base else text
             return new_messages, True

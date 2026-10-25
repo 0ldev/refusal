@@ -80,27 +80,55 @@ class TestMarkAsRefusal:
         choice = SimpleNamespace(message=SimpleNamespace(content="I refuse", refusal=None), finish_reason="stop")
         resp = SimpleNamespace(choices=[choice])
         detection = DetectionResult(is_refusal=True, kind="refusal", reason="direct_refusal")
-        _mark_as_refusal(resp, detection)
+        _mark_as_refusal(resp, detection, {"session_id": "s1", "model": "m1", "provider": "p1", "api_request_id": "r1"})
         assert choice.finish_reason == "content_filter"
         assert choice.message.refusal is not None
+
+    def test_mark_as_refusal_logs_correlation_keys(self, caplog):
+        # Hermes logs every content_filter response identically (content_policy_blocked), whether
+        # the provider signalled it or we synthesized it. These keys are the only way to join this
+        # line back to Hermes's own native log line and tell the two apart (see refusal/plugin.py
+        # docstring on _mark_as_refusal and hermes-agent issue #138900).
+        choice = SimpleNamespace(message=SimpleNamespace(content="I refuse", refusal=None), finish_reason="stop")
+        resp = SimpleNamespace(choices=[choice])
+        detection = DetectionResult(is_refusal=True, kind="refusal", reason="direct_refusal")
+        with caplog.at_level("WARNING"):
+            _mark_as_refusal(
+                resp, detection,
+                {"session_id": "sess-42", "model": "gemini-3.8-flash", "provider": "antigravity-oauth",
+                 "api_request_id": "req-99"},
+            )
+        record = caplog.records[-1]
+        assert "sess-42" in record.message
+        assert "gemini-3.8-flash" in record.message
+        assert "antigravity-oauth" in record.message
+        assert "req-99" in record.message
+
+    def test_mark_as_refusal_tolerates_missing_correlation_keys(self, caplog):
+        choice = SimpleNamespace(message=SimpleNamespace(content="I refuse", refusal=None), finish_reason="stop")
+        resp = SimpleNamespace(choices=[choice])
+        detection = DetectionResult(is_refusal=True, kind="refusal", reason="direct_refusal")
+        with caplog.at_level("WARNING"):
+            _mark_as_refusal(resp, detection, {})
+        assert choice.finish_reason == "content_filter"
 
     def test_mark_anthropic_response(self):
         resp = SimpleNamespace(content=[SimpleNamespace(text="I refuse")], stop_reason="end_turn")
         detection = DetectionResult(is_refusal=True, kind="refusal", reason="direct_refusal")
-        _mark_as_refusal(resp, detection)
+        _mark_as_refusal(resp, detection, {})
         assert resp.stop_reason == "refusal"
 
     def test_mark_codex_response(self):
         resp = SimpleNamespace(status="completed", incomplete_details=None)
         detection = DetectionResult(is_refusal=True, kind="refusal", reason="direct_refusal")
-        _mark_as_refusal(resp, detection)
+        _mark_as_refusal(resp, detection, {})
         assert resp.status == "incomplete"
         assert resp.incomplete_details == {"reason": "content_filter"}
 
     def test_mark_dict_response(self):
         resp = {"choices": [{"message": {"content": "I refuse"}, "finish_reason": "stop"}]}
         detection = DetectionResult(is_refusal=True, kind="refusal", reason="direct_refusal")
-        _mark_as_refusal(resp, detection)
+        _mark_as_refusal(resp, detection, {})
         assert resp["choices"][0]["finish_reason"] == "content_filter"
 
 
@@ -150,7 +178,7 @@ class TestHermesTransportDerivation:
         resp = SimpleNamespace(choices=[choice])
 
         detection = DetectionResult(is_refusal=True, kind="refusal", reason="policy_refusal")
-        _mark_as_refusal(resp, detection)
+        _mark_as_refusal(resp, detection, {})
 
         fr = trc._derive_finish_reason(agent, resp, [])
         assert fr == "content_filter"
@@ -173,7 +201,7 @@ class TestHermesTransportDerivation:
         resp = SimpleNamespace(content=[SimpleNamespace(text="I cannot do that", type="text")], stop_reason="end_turn")
 
         detection = DetectionResult(is_refusal=True, kind="refusal", reason="policy_refusal")
-        _mark_as_refusal(resp, detection)
+        _mark_as_refusal(resp, detection, {})
 
         fr = trc._derive_finish_reason(agent, resp, [])
         assert fr == "content_filter"

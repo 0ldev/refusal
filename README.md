@@ -14,12 +14,12 @@ Some primary models decline legitimate work, such as security research, penetrat
 - **Few false positives.** Tool-calling responses, code blocks, partial answers ("I can't do X, but here's Y") and idioms such as "can't help but" are treated as genuine answers. See [Limitations](#limitations) for what still gets through.
 - **Bounded cost.** The lazy spans and sentence-start whitespace in the patterns are length-bounded, and a reply with tens of thousands of blank lines is classified in a fraction of a second instead of stalling the agent.
 - **Retry preprompt (opt-in, bring your own text).** You can configure text that is appended to the system prompt of requests after a refusal is detected in the session, so the fallback retry is not made on a bare prompt. The plugin ships no text of its own and does nothing here until you set one.
-- **Public APIs only.** It uses the `llm_execution` and `llm_request` middlewares and two observer hooks, and never patches Hermes core.
+- **Public APIs only.** It uses the `llm_execution` and `llm_request` middlewares and four observer hooks (`on_session_finalize`, `on_session_reset`, `on_session_delete`, `post_compaction`), and never patches Hermes core.
 - **No dependencies, no network calls.** Detection is local and rule-based.
 
 ## Requirements
 
-- Hermes `>= 0.22.1` (the `requires_hermes` floor in `plugin.yaml`)
+- Hermes `>= 0.22.3` (the `requires_hermes` floor in `plugin.yaml`)
 - Python `>= 3.10`
 - At least one entry in `fallback_providers`. Without one, a detected refusal ends the turn (see [Behavior and disclosures](#behavior-and-disclosures)).
 
@@ -117,7 +117,7 @@ Each session has a *level*: 0 (unarmed), 1, or 2.
 
    Hermes moves on to the next fallback entry in every case. A refusal from a model the preprompt was not sent to (see `preprompt_models`) does not count as "despite the preprompt".
 4. With `preprompt_scope: turn` the level is forgotten when the next user turn starts. With `session` it lasts until the session is finalized or reset. If Hermes gives no `turn_id`, `turn` behaves like `session`.
-5. The ending session's armed state is dropped on `on_session_finalize` and `on_session_reset` (for a reset, the *old* session id). At most `max_armed_sessions` sessions are tracked; the least recently armed is evicted first.
+5. The ending session's armed state is dropped on `on_session_finalize`, `on_session_reset` (the *old* session id) and `on_session_delete`. When context compression rotates the session id, `post_compaction` carries the level (and a same-turn disarm) over to the new id. The last two hooks exist from Hermes 0.22.4; on older versions Hermes logs a one-line "unknown hook" warning at startup and never calls them (the plugin still works, see [Limitations](#limitations)). At most `max_armed_sessions` sessions are tracked; the least recently armed is evicted first.
 
 ### What happens on each outcome
 
@@ -143,7 +143,7 @@ The text is added where each provider reads its system prompt: the `system` mess
 
 | Level | Message | Meaning |
 |---|---|---|
-| WARNING | `Refusal detected (kind=…, reason=…, text=…)` | A text refusal was matched and the response marked |
+| WARNING | `Refusal detected (kind=…, reason=…, text=…, session=…, model=…, provider=…, api_request_id=…)` | A text refusal was matched and the response marked. The correlation fields are there so this line can be joined back to Hermes's own `content_policy_blocked` line — see [Limitations](#limitations) |
 | INFO | `provider-signalled refusal (…)` | The provider flagged the response itself |
 | INFO | `preprompt armed (session=… level=1)` | First refusal in the session |
 | INFO | `preprompt injected (session=… level=… provider=… model=…)` | A request was modified |
@@ -198,16 +198,17 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 - **Fallback costs tokens.** Hermes resends the full conversation to the fallback model, and the fallback provider bills for it.
 - **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback provider.
 - **Persistence is opt-in.** With `persist_state: true` the plugin reads and writes its own file in Hermes's plugin state directory (session ids, levels and turn ids only; see [Persistence](#persistence-optional)). With it off, the plugin writes nothing to disk.
-- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package (and, if enabled, its own plugin state) and stores no credentials. Armed state lives in process memory only, unless you opt in to `persist_state` (below).
+- **One environment variable is read.** `REFUSAL_PREPROMPT` (the kill switch), at call time. It is not a credential and is never written.
+- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads no files outside its own package (and, if enabled, its own plugin state) and stores no credentials. Armed state lives in process memory only, unless you opt in to `persist_state` (below).
 
 ## Limitations
 
 - **Pattern-based.** An unusual refusal phrasing can be missed, and a reply that quotes refusal language can be flagged. Inability that is explained by a technical reason ("I can't run that because the container has no network", "The repository is read-only") is recognized as a genuine answer, but only for the phrasings the filter knows, and never when the same stretch mentions policy or harm. Configure a fallback so a false positive does not discard the answer.
 - **Cannot see the fallback chain.** Hermes does not tell middleware whether a fallback exists, so with none configured the plugin still marks and arms, and Hermes shows the safety notice.
+- **Telemetry is conflated with real provider refusals.** Marking a response `content_filter` makes Hermes log and count it exactly like a provider's own safety-classifier block (`reason=content_policy_blocked`, `error_type=ContentPolicyBlocked` — see `agent/turn_truncation.py`); nothing downstream distinguishes a plugin match from a real one. The detection log line carries `session`/`model`/`provider`/`api_request_id` specifically so you can join it back to Hermes's native log line and tell them apart by hand; there is no way to fix the aggregate counts themselves from a plugin. [hermes-agent#138900](https://github.com/NousResearch/hermes-agent/issues/138900) asked for a public seam (a distinct registered failover reason) to avoid this; it was closed once this plugin shipped the workaround, without the seam landing.
 - **Same-model retries need a different route.** Hermes skips fallback entries that resolve to the backend that just failed (see below).
 - **State is per process by default.** Armed levels are not shared between gateway workers or processes and are lost on restart, unless you enable [`persist_state`](#persistence-optional).
 - **Request copying.** Registering a `llm_request` middleware makes Hermes deep-copy each outgoing payload once or twice (about 1 ms for a 700 KB request in my measurement), whether or not you configured a preprompt. The plugin returns `None` for requests it does not change, so Hermes records no trace entry and makes no further copy for them.
-- **Context compression** starts a new session id with no link to the old one that plugins can see, so an armed session is unarmed after a compression. The orphaned entry is removed by the `max_armed_sessions` eviction.
 - **Streaming.** The middleware sees the finished response, so a refusal that streamed to the user is still shown before the fallback runs.
 - **Sub-agents** have their own session ids and are armed independently of their parent.
 - **Auxiliary calls** (compression, titles) never pass through the request middleware and are unaffected.
@@ -216,7 +217,7 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 
 ## Upgrading from 0.1.x
 
-0.2.0 adds the `llm_request` middleware, two session hooks (`on_session_finalize`, `on_session_reset`) and the settings above. With no `preprompt` configured, behavior is identical to 0.1.x except that provider-signalled refusals are now recorded (they were already handled by Hermes). Existing configuration keeps working. See the [changelog](CHANGELOG.md).
+0.2.0 adds the `llm_request` middleware, four session hooks (`on_session_finalize`, `on_session_reset`, `on_session_delete`, `post_compaction`) and the settings above. With no `preprompt` configured, behavior is identical to 0.1.x except that provider-signalled refusals are now recorded (they were already handled by Hermes). Existing configuration keeps working. See the [changelog](CHANGELOG.md).
 
 ## Library usage
 
