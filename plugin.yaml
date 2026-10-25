@@ -20,7 +20,6 @@ provides_tools: []
 provides_hooks:
   - on_session_finalize
   - on_session_reset
-  - on_session_delete
 config_schema:
   jailbreak_kernel:
     type: bool

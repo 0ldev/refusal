@@ -211,7 +211,7 @@ def _arm_session(session_id: str) -> int:
 
 
 def _disarm_session(session_id: str = "", **_: Any) -> None:
-    """Forget a session's kernel level when Hermes finalizes, resets or deletes it."""
+    """Forget a session's kernel level when Hermes finalizes or resets it."""
     with _armed_lock:
         _armed.pop(str(session_id or ""), None)
 
@@ -303,5 +303,5 @@ def register(ctx: Any) -> None:
         ctx.register_middleware("llm_request", on_llm_request)
         logger.info("refusal registered as llm_execution + llm_request middleware")
     if hasattr(ctx, "register_hook"):
-        for hook in ("on_session_finalize", "on_session_reset", "on_session_delete"):
+        for hook in ("on_session_finalize", "on_session_reset"):
             ctx.register_hook(hook, _disarm_session)

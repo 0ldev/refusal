@@ -289,7 +289,7 @@ class TestSessionLifecycle:
         ctx.get_config.return_value = True
         plugin.register(ctx)
         hooks = {c.args[0] for c in ctx.register_hook.call_args_list}
-        assert hooks == {"on_session_finalize", "on_session_reset", "on_session_delete"}
+        assert hooks == {"on_session_finalize", "on_session_reset"}
         assert plugin._config_enabled is True
         ctx.get_config.return_value = MagicMock()  # non-bool, non-string -> off
         plugin.register(ctx)
