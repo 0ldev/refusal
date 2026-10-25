@@ -17,5 +17,14 @@ provides_middleware:
   - llm_execution
   - llm_request
 provides_tools: []
-provides_hooks: []
+provides_hooks:
+  - on_session_finalize
+  - on_session_reset
+  - on_session_delete
+config_schema:
+  jailbreak_kernel:
+    type: bool
+    default: false
+    label: Jailbreak kernel
+    description: "Opt in to appending a no-refusal directive to the system prompt of requests after a refusal is detected in the session"
 requires_env: []

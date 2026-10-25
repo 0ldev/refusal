@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from typing import Any, List, Tuple
 
+#: api_modes whose payload carries the system prompt in a top-level ``system`` field.
+_SYSTEM_FIELD_MODES = frozenset({"anthropic_messages", "bedrock_converse"})
+
 #: Highest kernel level: further refusals keep the session at MAX.
 MAX_LEVEL = 2
 
@@ -70,3 +73,46 @@ def inject_kernel(messages: Any, text: str) -> Tuple[Any, bool]:
 
     new_messages.insert(0, {"role": "system", "content": text})
     return new_messages, True
+
+
+def inject_into_request(request: Any, text: str, api_mode: str = "") -> Tuple[Any, bool]:
+    """Return ``(new_request, changed)`` with the kernel added where the provider reads its system prompt.
+
+    Hermes builds a different payload per ``api_mode``: chat completions carry a ``system``
+    message in ``messages``, Anthropic and Bedrock a top-level ``system`` field (a string or a
+    list of text blocks), and Responses/Codex a top-level ``instructions`` string. The input
+    request is never mutated.
+    """
+    if not isinstance(request, dict) or not text:
+        return request, False
+
+    if api_mode == "codex_responses" or "instructions" in request or "input" in request:
+        base = request.get("instructions")
+        base = base if isinstance(base, str) else ""
+        new_request = dict(request)
+        new_request["instructions"] = f"{base}\n\n{text}" if base else text
+        return new_request, True
+
+    if api_mode in _SYSTEM_FIELD_MODES or "system" in request:
+        system = request.get("system")
+        new_request = dict(request)
+        if isinstance(system, list):
+            bedrock = api_mode == "bedrock_converse" or (
+                bool(system) and isinstance(system[0], dict) and "type" not in system[0]
+            )
+            block = {"text": text} if bedrock else {"type": "text", "text": text}
+            new_request["system"] = [*system, block]
+        elif isinstance(system, str) and system:
+            new_request["system"] = f"{system}\n\n{text}"
+        elif api_mode == "bedrock_converse":
+            new_request["system"] = [{"text": text}]
+        else:
+            new_request["system"] = text
+        return new_request, True
+
+    new_messages, changed = inject_kernel(request.get("messages"), text)
+    if not changed:
+        return request, False
+    new_request = dict(request)
+    new_request["messages"] = new_messages
+    return new_request, True

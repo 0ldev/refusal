@@ -38,7 +38,8 @@ def _request():
 
 
 @pytest.fixture(autouse=True)
-def _clear_armed_state():
+def _clear_armed_state(monkeypatch):
+    monkeypatch.setenv("REFUSAL_JAILBREAK", "1")
     _armed.clear()
     yield
     _armed.clear()
@@ -180,8 +181,24 @@ class TestRequestInjection:
         on_llm_execution(next_call=next_call, request={}, session_id="s1")
         assert _armed.get("s1", 0) == 0
 
-    def test_jailbreak_enabled_default(self):
+    def test_jailbreak_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("REFUSAL_JAILBREAK", raising=False)
+        assert _jailbreak_enabled() is False
+
+    def test_env_flag_enables(self):
         assert _jailbreak_enabled() is True
+
+    def test_not_armed_or_injected_by_default(self, monkeypatch):
+        monkeypatch.delenv("REFUSAL_JAILBREAK", raising=False)
+
+        def next_call(req):
+            return _refusal_response()
+
+        on_llm_execution(next_call=next_call, request={}, session_id="s1")
+        assert _armed == {}
+        _armed["s1"] = 1
+        result = on_llm_request(_request(), session_id="s1")
+        assert result["request"]["messages"][0]["content"] == "You are Hermes."
 
 
 class TestEndToEndFlow:
@@ -206,3 +223,82 @@ class TestEndToEndFlow:
         system = retry["request"]["messages"][0]["content"]
         assert kernel.KERNEL_MAX in system
         assert kernel.KERNEL_CORE not in system
+
+
+class TestProviderShapes:
+    """The system prompt lives in a different field per api_mode."""
+
+    def _inject(self, request, api_mode):
+        _armed["s1"] = 1
+        return on_llm_request(request, session_id="s1", api_mode=api_mode)["request"]
+
+    def test_anthropic_string_system(self):
+        req = {"model": "claude", "system": "You are Hermes.", "messages": [{"role": "user", "content": "hi"}]}
+        out = self._inject(req, "anthropic_messages")
+        assert out["system"] == f"You are Hermes.\n\n{kernel.KERNEL_CORE}"
+        assert out["messages"] == req["messages"]
+        assert req["system"] == "You are Hermes."
+
+    def test_anthropic_block_system_keeps_cache_control(self):
+        blocks = [{"type": "text", "text": "You are Hermes.", "cache_control": {"type": "ephemeral"}}]
+        out = self._inject({"system": blocks, "messages": [{"role": "user", "content": "hi"}]}, "anthropic_messages")
+        assert out["system"][0] == blocks[0]
+        assert out["system"][1] == {"type": "text", "text": kernel.KERNEL_CORE}
+        assert len(blocks) == 1
+
+    def test_anthropic_without_system_adds_field_not_message(self):
+        req = {"messages": [{"role": "user", "content": "hi"}]}
+        out = self._inject(req, "anthropic_messages")
+        assert out["system"] == kernel.KERNEL_CORE
+        assert out["messages"] == req["messages"]
+
+    def test_bedrock_blocks_have_no_type(self):
+        out = self._inject({"system": [{"text": "base"}], "messages": []}, "bedrock_converse")
+        assert out["system"][-1] == {"text": kernel.KERNEL_CORE}
+        out = self._inject({"messages": []}, "bedrock_converse")
+        assert out["system"] == [{"text": kernel.KERNEL_CORE}]
+
+    def test_codex_instructions(self):
+        req = {"instructions": "You are Hermes.", "input": [{"role": "user", "content": "hi"}]}
+        out = self._inject(req, "codex_responses")
+        assert out["instructions"] == f"You are Hermes.\n\n{kernel.KERNEL_CORE}"
+        assert out["input"] == req["input"]
+        assert "messages" not in out
+
+    def test_chat_completions_unchanged_behaviour(self):
+        out = self._inject(_request(), "chat_completions")
+        assert kernel.KERNEL_CORE in out["messages"][0]["content"]
+
+
+class TestSessionLifecycle:
+    def test_disarm_hooks_forget_session(self):
+        from refusal.plugin import _disarm_session
+
+        _armed.update({"s1": 1, "s2": 2})
+        _disarm_session(session_id="s1", completed=True)
+        assert _armed == {"s2": 2}
+        _disarm_session(session_id="missing")
+        _disarm_session()
+        assert _armed == {"s2": 2}
+
+    def test_register_wires_cleanup_hooks_and_reads_setting(self):
+        from unittest.mock import MagicMock
+        from refusal import plugin
+
+        ctx = MagicMock()
+        ctx.get_config.return_value = True
+        plugin.register(ctx)
+        hooks = {c.args[0] for c in ctx.register_hook.call_args_list}
+        assert hooks == {"on_session_finalize", "on_session_reset", "on_session_delete"}
+        assert plugin._config_enabled is True
+        ctx.get_config.return_value = MagicMock()  # non-bool, non-string -> off
+        plugin.register(ctx)
+        assert plugin._config_enabled is False
+
+    def test_armed_table_is_bounded(self, monkeypatch):
+        from refusal import plugin
+
+        monkeypatch.setattr(plugin, "_MAX_ARMED_SESSIONS", 3)
+        for i in range(5):
+            plugin._arm_session(f"s{i}")
+        assert list(_armed) == ["s2", "s3", "s4"]

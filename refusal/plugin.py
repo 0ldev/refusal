@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from . import kernel
@@ -18,7 +20,17 @@ _detector = RefusalDetector()
 #: level by one (capped at kernel.MAX_LEVEL); the llm_request middleware injects
 #: the active kernel text into the system message of every request for an armed
 #: session, so the fallback retry carries the preprompt.
-_armed: dict[str, int] = {}
+_armed: OrderedDict[str, int] = OrderedDict()
+_armed_lock = threading.Lock()
+
+#: Upper bound on tracked sessions; the least recently armed entry is evicted first.
+_MAX_ARMED_SESSIONS = 1024
+
+#: Opt-in switch from the ``jailbreak_kernel`` plugin setting, captured in register().
+_config_enabled = False
+
+_TRUE = {"1", "on", "true", "yes"}
+_FALSE = {"0", "off", "false", "no"}
 
 
 def _has_tool_calls(response: Any) -> bool:
@@ -166,12 +178,18 @@ def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
 
 
 def _jailbreak_enabled() -> bool:
-    """Kill switch: REFUSAL_JAILBREAK=0 disables kernel arming/injection.
+    """Opt-in switch for kernel arming/injection (off unless enabled).
 
-    Read at call time so the switch works without a restart. Detection and
-    fallback routing are unaffected.
+    ``REFUSAL_JAILBREAK`` overrides the ``jailbreak_kernel`` plugin setting in both
+    directions and is read at call time. Detection and fallback routing are
+    unaffected either way.
     """
-    return os.environ.get("REFUSAL_JAILBREAK", "1").strip().lower() not in {"0", "off", "false", "no"}
+    override = os.environ.get("REFUSAL_JAILBREAK", "").strip().lower()
+    if override in _TRUE:
+        return True
+    if override in _FALSE:
+        return False
+    return _config_enabled
 
 
 def _session_id_from_context(kwargs: Any) -> str:
@@ -181,9 +199,19 @@ def _session_id_from_context(kwargs: Any) -> str:
 
 def _arm_session(session_id: str) -> int:
     """Raise the session's kernel level by one (capped) and return the new level."""
-    level = min(_armed.get(session_id, 0) + 1, kernel.MAX_LEVEL)
-    _armed[session_id] = level
+    with _armed_lock:
+        level = min(_armed.get(session_id, 0) + 1, kernel.MAX_LEVEL)
+        _armed[session_id] = level
+        _armed.move_to_end(session_id)
+        while len(_armed) > _MAX_ARMED_SESSIONS:
+            _armed.popitem(last=False)
     return level
+
+
+def _disarm_session(session_id: str = "", **_: Any) -> None:
+    """Forget a session's kernel level when Hermes finalizes, resets or deletes it."""
+    with _armed_lock:
+        _armed.pop(str(session_id or ""), None)
 
 
 def on_llm_request(request: Any, **context: Any) -> dict:
@@ -199,14 +227,13 @@ def on_llm_request(request: Any, **context: Any) -> dict:
     try:
         if _jailbreak_enabled():
             session_id = _session_id_from_context(context)
-            level = _armed.get(session_id, 0)
+            with _armed_lock:
+                level = _armed.get(session_id, 0)
             if session_id and level >= 1:
-                new_messages, changed = kernel.inject_kernel(
-                    request.get("messages"), kernel.kernel_text(level)
+                new_request, changed = kernel.inject_into_request(
+                    request, kernel.kernel_text(level), str(context.get("api_mode") or "")
                 )
                 if changed:
-                    new_request = dict(request)
-                    new_request["messages"] = new_messages
                     logger.info(
                         "jailbreak kernel injected (session=%s level=%d model=%s)",
                         session_id, level, context.get("model"),
@@ -242,9 +269,25 @@ def on_llm_execution(**kwargs: Any) -> Any:
     return response
 
 
+def _setting_enabled(ctx: Any) -> bool:
+    """Read the ``jailbreak_kernel`` plugin setting (False when absent or not a boolean/flag string)."""
+    try:
+        value = ctx.get_config("jailbreak_kernel", False)
+    except Exception:
+        return False
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() in _TRUE
+
+
 def register(ctx: Any) -> None:
-    """Register the llm_execution and llm_request middlewares with Hermes."""
+    """Register the middlewares and the session-cleanup hooks with Hermes."""
+    global _config_enabled
+    _config_enabled = _setting_enabled(ctx)
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware("llm_execution", on_llm_execution)
         ctx.register_middleware("llm_request", on_llm_request)
         logger.info("refusal registered as llm_execution + llm_request middleware")
+    if hasattr(ctx, "register_hook"):
+        for hook in ("on_session_finalize", "on_session_reset", "on_session_delete"):
+            ctx.register_hook(hook, _disarm_session)
