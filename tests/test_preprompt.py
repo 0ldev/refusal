@@ -60,9 +60,11 @@ def _clear_armed_state(monkeypatch):
     monkeypatch.setattr(plugin_mod, "_texts", (LEVEL_ONE, LEVEL_TWO))
     _armed.clear()
     plugin_mod._armed_turns.clear()
+    plugin_mod._disarmed_turns.clear()
     yield
     _armed.clear()
     plugin_mod._armed_turns.clear()
+    plugin_mod._disarmed_turns.clear()
 
 
 class TestMessageInjection:
@@ -647,3 +649,56 @@ class TestNoDoubleInjection:
         once = _mw(_request(), session_id="s1")["request"]
         assert on_llm_request(once, session_id="s1") is None
         assert _system(once).count(LEVEL_ONE) == 1
+
+
+class TestListContentSystemMessage:
+    def test_text_part_is_appended_and_existing_parts_survive(self):
+        parts = [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}]
+        messages = [{"role": "system", "content": parts}, {"role": "user", "content": "hi"}]
+        new, changed = preprompt.inject_into_messages(messages, "X")
+        assert changed is True
+        assert new[0]["content"] == [*parts, {"type": "text", "text": "X"}]
+        assert messages[0]["content"] == parts and len(parts) == 1  # input not mutated
+
+    def test_request_contains_sees_the_appended_part(self):
+        messages = [{"role": "system", "content": [{"type": "text", "text": "base"}]}]
+        new, _ = preprompt.inject_into_messages(messages, "X")
+        assert preprompt.request_contains({"messages": new}, "X")
+
+
+class TestBookkeepingDoesNotBlockFailover:
+    def test_refusal_is_marked_even_if_arming_raises(self, monkeypatch):
+        marked = []
+        monkeypatch.setattr(plugin_mod, "_texts", (LEVEL_ONE, LEVEL_TWO))
+        monkeypatch.setattr(plugin_mod, "_mark_as_refusal", lambda r, d: marked.append(d))
+        monkeypatch.setattr(plugin_mod, "_handle_refusal", lambda *a, **k: 1 / 0)
+        _round("s1", turn_id="t1")
+        assert len(marked) == 1
+
+
+class TestDisarmIsStickyWithinATurn:
+    def _arm_then_fail_with_preprompt(self, turn):
+        _round("s1", turn_id=turn)                       # genuine refusal -> armed
+        assert plugin_mod._peek_level("s1") == 1
+        effective, _ = _round("s1", turn_id=turn)        # refuses despite the preprompt -> disarmed
+        assert preprompt.request_contains(effective, LEVEL_ONE)
+        assert plugin_mod._peek_level("s1") == 0
+
+    def test_later_refusal_in_the_same_turn_does_not_rearm(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "disarm")
+        self._arm_then_fail_with_preprompt("t1")
+        effective, _ = _round("s1", turn_id="t1")        # next fallback, no preprompt, refuses too
+        assert not preprompt.request_contains(effective, LEVEL_ONE)
+        assert plugin_mod._peek_level("s1") == 0
+
+    def test_a_new_turn_can_arm_again(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "disarm")
+        self._arm_then_fail_with_preprompt("t1")
+        _round("s1", turn_id="t2")
+        assert plugin_mod._peek_level("s1") == 1
+
+    def test_session_end_forgets_the_marker(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "disarm")
+        self._arm_then_fail_with_preprompt("t1")
+        plugin_mod._disarm_session(session_id="s1")
+        assert "s1" not in plugin_mod._disarmed_turns

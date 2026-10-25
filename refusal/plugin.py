@@ -48,6 +48,11 @@ _models: tuple[str, ...] = ()
 #: turn_id in which each armed session was last armed (for ``turn`` scope).
 _armed_turns: dict[str, str] = {}
 
+#: turn_id in which a session was last disarmed after refusing despite the preprompt, so a later
+#: refusal in that same turn (a second fallback, a tool-loop retry) does not arm it again.
+#: Process-local; only effective when Hermes supplies a turn_id.
+_disarmed_turns: dict[str, str] = {}
+
 #: Also arm on provider-signalled refusals (``stop_reason=refusal``, ``finish_reason=content_filter``),
 #: which carry no matchable text. Hermes falls back on these by itself.
 _arm_on_native = True
@@ -329,6 +334,7 @@ def _disarm_session(session_id: str = "", old_session_id: str = "", **_: Any) ->
     for sid in (session_id, old_session_id):
         if sid:
             _set_level(str(sid), 0)
+            _disarmed_turns.pop(str(sid), None)
 
 
 def _model_allowed(context: Any) -> bool:
@@ -395,6 +401,17 @@ def on_llm_request(request: Any, **context: Any) -> dict | None:
     return None
 
 
+def _remember_disarm(session_id: str, turn_id: str) -> None:
+    """Note that the session was disarmed in this turn (bounded like the armed table)."""
+    if not turn_id:
+        return
+    with _armed_lock:
+        _disarmed_turns.pop(session_id, None)
+        _disarmed_turns[session_id] = turn_id
+        while len(_disarmed_turns) > _max_armed_sessions:
+            _disarmed_turns.pop(next(iter(_disarmed_turns)))
+
+
 def _handle_refusal(request: Any, kwargs: Any) -> None:
     """Update the session's level after a detected refusal and log what happened."""
     session_id = _session_id_from_context(kwargs)
@@ -414,10 +431,13 @@ def _handle_refusal(request: Any, kwargs: Any) -> None:
         elif _on_preprompt_refusal == "disarm":
             new_level = 0
             _set_level(session_id, 0)
+            _remember_disarm(session_id, turn_id)
         else:
             new_level = level
         logger.warning("refused despite preprompt (%s); mode=%s -> level %d",
                        where, _on_preprompt_refusal, new_level)
+    elif level == 0 and turn_id and _disarmed_turns.get(session_id) == turn_id:
+        logger.info("refused again after disarm in this turn (%s); staying disarmed", where)
     elif level == 0:
         logger.info("preprompt armed (%s) -> level %d", where, _arm_session(session_id, turn_id))
     else:
@@ -461,8 +481,9 @@ def _inspect_response(request: Any, response: Any, kwargs: Any) -> None:
         return
     detection = _detector.detect(text)
     if detection.is_refusal:
-        _handle_refusal(request, kwargs)
+        # Mark first: failover must not depend on the optional preprompt bookkeeping.
         _mark_as_refusal(response, detection)
+        _handle_refusal(request, kwargs)
     elif _preprompt_enabled() and preprompt.request_contains(
         request, preprompt.preprompt_text(_peek_level(_session_id_from_context(kwargs)) or 1, _texts)
     ):
