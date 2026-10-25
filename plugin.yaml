@@ -1,7 +1,7 @@
 name: refusal
 label: Refusal
-version: 0.1.0
-description: Detects model refusals and deflections and retries the turn on a fallback model
+version: 0.2.0
+description: Detects model refusals and deflections, retries the turn on a fallback model, and injects a jailbreak kernel into the retry
 author: 0ldev
 license: MIT
 homepage: https://github.com/0ldev/refusal
@@ -10,10 +10,12 @@ tags:
   - safety
   - refusal
   - routing
+  - jailbreak
 requires_hermes: ">=0.22.1"
 capabilities: []
 provides_middleware:
   - llm_execution
+  - llm_request
 provides_tools: []
 provides_hooks: []
 requires_env: []
