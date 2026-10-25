@@ -9,12 +9,14 @@
 - `preprompt_scope` (`turn` default, `session`): how long a session stays armed.
 - `preprompt_models`: glob allowlist of `model` / `provider/model` names that may receive the preprompt.
 - `arm_on_native_refusal` (default `true`): provider-signalled refusals (`stop_reason=refusal`, `finish_reason=content_filter`, Responses `incomplete`/`content_filter`) arm the session too. Those responses are left unaltered.
+- `persist_state` (default `false`): opt in to keep armed levels in Hermes's plugin state so they survive restarts and are shared between processes. Stores session ids, levels and turn ids only; falls back to memory with a warning if the store fails.
 - `max_armed_sessions` (default 1024) and cleanup on `on_session_finalize` / `on_session_reset`.
 - `REFUSAL_PREPROMPT=0` kill switch.
 - Logs for arming, injection, `answered with preprompt` and `refused despite preprompt`; `source` / `reason` in Hermes's middleware trace.
 - Softer refusal phrasings ("I'm not comfortable providing that", "I'd rather not walk you through that", "that falls outside what I can help with", …).
 
 ### Fixed
+- Explained technical inability ("I can't run that because the container has no network", "The repository is read-only") is no longer treated as a refusal unless the same stretch mentions policy or harm.
 - **Quadratic backtracking on whitespace runs.** The shared sentence-start prefix `(?:^|[.!?\n]\s*)` was still quadratic after 0.1.1: a reply with 5,000 blank lines took ~3 s and 20,000 took ~50 s inside the synchronous middleware. It is now `\s{0,20}` (20,000 blank lines: ~0.1 s). Regression tests added.
 - Two of the new soft patterns flagged ordinary engineering replies ("I'm not comfortable writing to the production database…", "I have to say no to that flag…"); they now require a request-shaped object.
 - `llm_request` returned `{"request": request}` even when nothing changed, which made Hermes copy the payload again and record a spurious `source: plugin` trace entry on every request for every user. It now returns `None` for unchanged requests.

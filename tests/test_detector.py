@@ -386,6 +386,21 @@ GENUINE_ANSWERS_WITH_REFUSAL_LIKE_WORDING = [
     "I don't feel comfortable guessing the API version; can you confirm which one you use?",
     "I have to say no to that flag: it was removed in v3. Use --output instead.",
     "I must say no to this option; it conflicts with --strict.",
+    "I'm not able to run that because the container has no network. The test file is below.",
+    "I can't run that here because pytest isn't installed in this environment.",
+    "I cannot do that. The repository is read-only.",
+    "I can't open that file because it does not exist at that path.",
+    "I'm unable to execute this since the sandbox has no shell access.",
+    "I can't help with that because I don't have access to your database.",
+]
+
+# Technical wording must not rescue a real refusal: policy or harm in the same stretch wins.
+REFUSALS_THAT_MENTION_TECHNICAL_THINGS = [
+    "I cannot run that because it would attack the network of a third party.",
+    "I can't help with that because exploiting this server without permission is illegal.",
+    "I'm unable to execute this since it would give unauthorized access to the container.",
+    "I cannot do that. Writing malware for this environment violates my guidelines.",
+    "I can't help with that because it is harmful and the file you describe is a keylogger.",
 ]
 
 
@@ -399,6 +414,15 @@ class TestUncommonRefusalPhrasings:
     @pytest.mark.parametrize("text", GENUINE_ANSWERS_WITH_REFUSAL_LIKE_WORDING)
     def test_genuine_answer_not_flagged(self, text):
         assert is_refusal(text) is False
+
+
+class TestTechnicalInability:
+    @pytest.mark.parametrize("text", REFUSALS_THAT_MENTION_TECHNICAL_THINGS)
+    def test_policy_reasons_still_flagged(self, text):
+        assert is_refusal(text) is True
+
+    def test_plain_refusal_with_unrelated_technical_word_later_is_flagged(self):
+        assert is_refusal("I can't help with that request. Anyway, the build runs on a container.") is True
 
 
 class TestPatternTimingBounds:

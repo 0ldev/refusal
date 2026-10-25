@@ -68,6 +68,7 @@ The retry preprompt and its controls are plugin settings under `plugins.entries.
 | `preprompt_scope` | `turn` \| `session` | `turn` | How long a session stays armed. |
 | `preprompt_models` | list of globs | empty (any) | Only send the preprompt to matching `model` or `provider/model` names. |
 | `arm_on_native_refusal` | bool | `true` | Also arm on provider-signalled refusals. |
+| `persist_state` | bool | `false` | Keep armed levels in Hermes's plugin state so they survive a restart and are shared between processes. See [Persistence](#persistence-optional). |
 | `max_armed_sessions` | int ≥ 1 | `1024` | How many armed sessions are tracked at once. |
 
 Environment: `REFUSAL_PREPROMPT=0` (or `off`, `false`, `no`) disables arming and injection regardless of the settings. It is read at call time, so it works without a restart.
@@ -97,6 +98,7 @@ plugins:
         preprompt_scope: turn             # turn | session
         preprompt_models: []              # e.g. ["google/gemini-*"]; empty = any model
         arm_on_native_refusal: true
+        persist_state: false              # opt in to survive restarts / share between processes
         max_armed_sessions: 1024
 ```
 
@@ -152,6 +154,21 @@ The text is added where each provider reads its system prompt: the `system` mess
 
 Injected requests also carry `source: refusal` and a `reason` in Hermes's middleware trace.
 
+### Persistence (optional)
+
+By default armed levels live in process memory. With `persist_state: true` the plugin keeps them in Hermes's per-plugin state store (`ctx.state`, a JSON file under `<HERMES_HOME>/plugin-data/refusal/state.json`, written atomically under a cross-process file lock), so:
+
+- an armed session survives a gateway restart, and
+- several processes serving the same profile see the same levels.
+
+What is stored: a single list of `[session_id, level, turn_id]` rows, at most `max_armed_sessions` of them. **No preprompt text, no message content and no credentials are stored.** Rows are removed when a session is finalized or reset and when the cap evicts them.
+
+Costs and caveats:
+
+- While the preprompt is configured, each request reads the file once (and each arming or disarm writes it). The read is a small JSON file under an advisory lock.
+- Updates are a read-merge-write of the whole list, so two processes arming at the same instant can lose one update (last writer wins).
+- If the store cannot be read or written, the plugin logs a WARNING and falls back to memory for the rest of the process. A Hermes that has no `ctx.state` also falls back, with a warning.
+
 ### Reaching the same model on the retry
 
 Hermes skips fallback entries that resolve to the same backend as the current one (same provider + model), so to retry the *same model* the fallback entry must be a **different route to the same model**:
@@ -180,14 +197,15 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 - **The matched snippet is logged.** A detected refusal logs the matching part of the response at WARNING. Your preprompt text is never logged.
 - **Fallback costs tokens.** Hermes resends the full conversation to the fallback model, and the fallback provider bills for it.
 - **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback provider.
-- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package and stores no credentials. Armed state lives in process memory only.
+- **Persistence is opt-in.** With `persist_state: true` the plugin reads and writes its own file in Hermes's plugin state directory (session ids, levels and turn ids only; see [Persistence](#persistence-optional)). With it off, the plugin writes nothing to disk.
+- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package (and, if enabled, its own plugin state) and stores no credentials. Armed state lives in process memory only, unless you opt in to `persist_state` (below).
 
 ## Limitations
 
-- **Pattern-based.** An unusual refusal phrasing can be missed, and a reply that quotes refusal language can be flagged. Plain statements of technical inability ("I'm not able to run that because the container has no network") can also match; configure a fallback so a false positive does not discard the answer.
+- **Pattern-based.** An unusual refusal phrasing can be missed, and a reply that quotes refusal language can be flagged. Inability that is explained by a technical reason ("I can't run that because the container has no network", "The repository is read-only") is recognized as a genuine answer, but only for the phrasings the filter knows, and never when the same stretch mentions policy or harm. Configure a fallback so a false positive does not discard the answer.
 - **Cannot see the fallback chain.** Hermes does not tell middleware whether a fallback exists, so with none configured the plugin still marks and arms, and Hermes shows the safety notice.
 - **Same-model retries need a different route.** Hermes skips fallback entries that resolve to the backend that just failed (see below).
-- **State is per process.** Armed levels are not shared between gateway workers or processes, and they are lost on restart.
+- **State is per process by default.** Armed levels are not shared between gateway workers or processes and are lost on restart, unless you enable [`persist_state`](#persistence-optional).
 - **Request copying.** Registering a `llm_request` middleware makes Hermes deep-copy each outgoing payload once or twice (about 1 ms for a 700 KB request in my measurement), whether or not you configured a preprompt. The plugin returns `None` for requests it does not change, so Hermes records no trace entry and makes no further copy for them.
 - **Context compression** starts a new session id with no link to the old one that plugins can see, so an armed session is unarmed after a compression. The orphaned entry is removed by the `max_armed_sessions` eviction.
 - **Streaming.** The middleware sees the finished response, so a refusal that streamed to the user is still shown before the fallback runs.

@@ -52,6 +52,11 @@ config_schema:
     default: true
     label: Arm on provider-signalled refusals
     description: "Also treat a provider's own refusal signal (Anthropic stop_reason=refusal, finish_reason=content_filter) as a refusal for the retry preprompt, not only matched text"
+  persist_state:
+    type: bool
+    default: false
+    label: Persist armed sessions
+    description: "Off by default. When on, armed session ids, levels and turn ids (never any text) are kept in Hermes's plugin state so they survive a restart and are shared between processes. Costs one small file read per request while the preprompt is configured"
   max_armed_sessions:
     type: int
     default: 1024

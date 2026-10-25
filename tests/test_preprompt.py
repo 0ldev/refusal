@@ -541,3 +541,101 @@ class TestUnchangedRequests:
         _armed["s1"] = 1
         monkeypatch.setattr(preprompt, "inject_into_request", lambda *a, **k: 1 / 0)
         assert on_llm_request(_request(), session_id="s1") is None
+
+
+class _FakeState:
+    """Stands in for Hermes's ctx.state (JSON get/set shared by every 'process')."""
+
+    def __init__(self):
+        self.data = {}
+        self.fail = False
+
+    def get(self, key, default=None):
+        if self.fail:
+            raise RuntimeError("disk gone")
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        if self.fail:
+            raise RuntimeError("disk gone")
+        self.data[key] = value
+
+
+@pytest.fixture
+def persisted(monkeypatch):
+    state = _FakeState()
+    monkeypatch.setattr(plugin_mod, "_persist", True)
+    monkeypatch.setattr(plugin_mod, "_state", state)
+    return state
+
+
+class TestPersistence:
+    def test_off_by_default_and_register_reads_the_setting(self):
+        from unittest.mock import MagicMock
+
+        ctx = MagicMock()
+        ctx.get_config.side_effect = lambda key, default=None: default
+        plugin_mod.register(ctx)
+        assert plugin_mod._persist is False and plugin_mod._state is None
+
+        values = {"persist_state": True}
+        ctx.get_config.side_effect = lambda key, default=None: values.get(key, default)
+        plugin_mod.register(ctx)
+        try:
+            assert plugin_mod._persist is True and plugin_mod._state is ctx.state
+        finally:
+            plugin_mod._persist, plugin_mod._state = False, None
+
+    def test_missing_ctx_state_falls_back_to_memory(self, caplog):
+        ctx = SimpleNamespace(get_config=lambda k, d=None: True if k == "persist_state" else d,
+                              register_middleware=lambda *a: None, register_hook=lambda *a: None)
+        with caplog.at_level("WARNING"):
+            plugin_mod.register(ctx)
+        assert plugin_mod._persist is False
+        assert any("exposes no ctx.state" in r.message for r in caplog.records)
+
+    def test_nothing_is_written_when_off(self):
+        state = _FakeState()
+        plugin_mod._state = state
+        plugin_mod._arm_session("s1", "t1")
+        assert state.data == {}
+        plugin_mod._state = None
+
+    def test_arming_is_written_through(self, persisted):
+        plugin_mod._arm_session("s1", "t1")
+        assert persisted.data["armed"] == [["s1", 1, "t1"]]
+        plugin_mod._disarm_session(session_id="s1")
+        assert persisted.data["armed"] == []
+
+    def test_survives_a_restart(self, persisted):
+        _round("s1", turn_id="t1")                 # bare refusal -> level 1, stored
+        _armed.clear(); plugin_mod._armed_turns.clear()   # the process restarts
+        eff = _mw(_request(), session_id="s1", turn_id="t1")["request"]
+        assert LEVEL_ONE in _system(eff)
+
+    def test_two_processes_share_the_state(self, persisted):
+        _round("s1", turn_id="t1")                 # process A arms
+        _armed.clear(); plugin_mod._armed_turns.clear()   # process B starts with an empty table
+        assert _mw(_request(), session_id="s1", turn_id="t1")["request"] is not None
+        _round("s1", turn_id="t1")                 # B sees A's level, is refused despite it -> disarm
+        assert persisted.data["armed"] == []
+
+    def test_eviction_is_stored_too(self, persisted, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_max_armed_sessions", 2)
+        for sid in ("a", "b", "c"):
+            plugin_mod._arm_session(sid)
+        assert [row[0] for row in persisted.data["armed"]] == ["b", "c"]
+
+    def test_corrupt_rows_are_skipped(self, persisted):
+        persisted.data["armed"] = [["ok", 1, "t"], "junk", ["x", 9, "t"], ["y", True, "t"], [1, 1, "t"], ["z", 2]]
+        assert plugin_mod._peek_level("ok") == 1
+        assert list(_armed) == ["ok"]
+
+    def test_storage_errors_fall_back_to_memory_with_a_warning(self, persisted, caplog):
+        plugin_mod._arm_session("s1")
+        persisted.fail = True
+        with caplog.at_level("WARNING"):
+            assert plugin_mod._arm_session("s2") == 1   # still works
+        assert plugin_mod._persist is False
+        assert any("not writable" in r.message or "unreadable" in r.message for r in caplog.records)
+        assert plugin_mod._peek_level("s2") == 1

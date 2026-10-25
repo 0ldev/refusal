@@ -52,6 +52,12 @@ _armed_turns: dict[str, str] = {}
 #: which carry no matchable text. Hermes falls back on these by itself.
 _arm_on_native = True
 
+#: Opt-in: keep armed levels in Hermes's plugin state (``ctx.state``) so they survive a restart
+#: and are shared between processes. ``_state`` is that facade, captured in register().
+_persist = False
+_state: Any = None
+_STATE_KEY = "armed"
+
 _TRUE = {"1", "on", "true", "yes"}
 _FALSE = {"0", "off", "false", "no"}
 
@@ -234,6 +240,48 @@ def _session_id_from_context(kwargs: Any) -> str:
     return str(kwargs.get("session_id") or "")
 
 
+def _refresh_locked() -> None:
+    """With persistence on, replace the in-memory table with the stored one (caller holds the lock).
+
+    The stored value is a list of ``[session_id, level, turn_id]`` in least-recently-armed-first
+    order. Any storage error turns persistence off for the rest of the process.
+    """
+    global _persist
+    if not (_persist and _state is not None):
+        return
+    try:
+        rows = _state.get(_STATE_KEY, [])
+        table: OrderedDict[str, int] = OrderedDict()
+        turns: dict[str, str] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not (isinstance(row, (list, tuple)) and len(row) == 3):
+                continue
+            sid, level, turn = row
+            if isinstance(sid, str) and type(level) is int and 1 <= level <= preprompt.MAX_LEVEL:
+                table[sid] = level
+                turns[sid] = turn if isinstance(turn, str) else ""
+    except Exception as exc:
+        _persist = False
+        logger.warning("refusal: plugin state unreadable, keeping armed levels in memory only: %s", exc)
+        return
+    _armed.clear()
+    _armed.update(table)
+    _armed_turns.clear()
+    _armed_turns.update(turns)
+
+
+def _flush_locked() -> None:
+    """With persistence on, write the in-memory table to the plugin state (caller holds the lock)."""
+    global _persist
+    if not (_persist and _state is not None):
+        return
+    try:
+        _state.set(_STATE_KEY, [[sid, lvl, _armed_turns.get(sid, "")] for sid, lvl in _armed.items()])
+    except Exception as exc:
+        _persist = False
+        logger.warning("refusal: plugin state not writable, keeping armed levels in memory only: %s", exc)
+
+
 def _set_level_locked(session_id: str, level: int, turn_id: str = "") -> None:
     """Record a session's level (0 removes it); evicts the least recently armed over the cap.
 
@@ -252,16 +300,20 @@ def _set_level_locked(session_id: str, level: int, turn_id: str = "") -> None:
 
 
 def _set_level(session_id: str, level: int, turn_id: str = "") -> None:
-    """Locking wrapper around :func:`_set_level_locked`."""
+    """Locking wrapper around :func:`_set_level_locked`; merges with and writes back the stored table."""
     with _armed_lock:
+        _refresh_locked()
         _set_level_locked(session_id, level, turn_id)
+        _flush_locked()
 
 
 def _arm_session(session_id: str, turn_id: str = "") -> int:
     """Raise the session's level by one (capped) and return the new level."""
     with _armed_lock:
+        _refresh_locked()
         level = min(_armed.get(session_id, 0) + 1, preprompt.MAX_LEVEL)
         _set_level_locked(session_id, level, turn_id)
+        _flush_locked()
     return level
 
 
@@ -289,12 +341,14 @@ def _model_allowed(context: Any) -> bool:
 def _peek_level(session_id: str) -> int:
     """The session's stored level without applying ``turn`` scope."""
     with _armed_lock:
+        _refresh_locked()
         return _armed.get(session_id, 0)
 
 
 def _current_level(session_id: str, turn_id: str) -> int:
     """The session's level, forgetting it first when ``turn`` scope says a new turn began."""
     with _armed_lock:
+        _refresh_locked()
         level = _armed.get(session_id, 0)
         armed_turn = _armed_turns.get(session_id, "")
     if level and _scope == "turn" and turn_id and armed_turn and armed_turn != turn_id:
@@ -471,13 +525,18 @@ def _setting_models(ctx: Any) -> tuple[str, ...]:
 
 def register(ctx: Any) -> None:
     """Register the middlewares and the session-cleanup hooks with Hermes."""
-    global _texts, _max_armed_sessions, _on_preprompt_refusal, _scope, _models, _arm_on_native
+    global _texts, _max_armed_sessions, _on_preprompt_refusal, _scope, _models, _arm_on_native, _persist, _state
     _texts = (_setting_text(ctx, "preprompt"), _setting_text(ctx, "preprompt_escalated"))
     _max_armed_sessions = _setting_max_sessions(ctx)
     _on_preprompt_refusal = _setting_choice(ctx, "on_preprompt_refusal", _ON_REFUSAL_MODES, "disarm")
     _scope = _setting_choice(ctx, "preprompt_scope", _SCOPES, "turn")
     _models = _setting_models(ctx)
     _arm_on_native = _setting_flag(ctx, "arm_on_native_refusal", True)
+    _persist = _setting_flag(ctx, "persist_state", False)
+    _state = getattr(ctx, "state", None) if _persist else None
+    if _persist and _state is None:
+        _persist = False
+        logger.warning("refusal: persist_state is on but this Hermes exposes no ctx.state; using memory only")
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware("llm_execution", on_llm_execution)
         ctx.register_middleware("llm_request", on_llm_request)
