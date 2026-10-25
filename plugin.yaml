@@ -29,7 +29,7 @@ config_schema:
     type: str
     default: ""
     label: Escalated retry preprompt
-    description: "Optional text used instead of the preprompt once a second refusal is detected in the same session"
+    description: "Optional text used instead of the preprompt after the preprompt itself was refused (only with on_preprompt_refusal: escalate). Empty reuses the preprompt"
   on_preprompt_refusal:
     type: str
     choices: [disarm, escalate, keep]

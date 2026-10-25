@@ -265,9 +265,15 @@ def _arm_session(session_id: str, turn_id: str = "") -> int:
     return level
 
 
-def _disarm_session(session_id: str = "", **_: Any) -> None:
-    """Forget a session's level when Hermes finalizes or resets it."""
-    _set_level(str(session_id or ""), 0)
+def _disarm_session(session_id: str = "", old_session_id: str = "", **_: Any) -> None:
+    """Forget the level of the session that is ending.
+
+    ``on_session_finalize`` passes the ending session as ``session_id``; ``on_session_reset``
+    passes the *new* session as ``session_id`` and the ending one as ``old_session_id``.
+    """
+    for sid in (session_id, old_session_id):
+        if sid:
+            _set_level(str(sid), 0)
 
 
 def _model_allowed(context: Any) -> bool:
@@ -297,16 +303,17 @@ def _current_level(session_id: str, turn_id: str) -> int:
     return level
 
 
-def on_llm_request(request: Any, **context: Any) -> dict:
+def on_llm_request(request: Any, **context: Any) -> dict | None:
     """Append the configured preprompt to the system prompt of outgoing requests.
 
     Runs before every provider call. Requests for unarmed sessions (level 0), or to a
-    provider/model outside ``preprompt_models``, pass through untouched, so a turn's
+    provider/model outside ``preprompt_models``, are left alone by returning ``None``
+    (Hermes then neither copies the payload nor records a trace entry), so a turn's
     first call is made without the preprompt and a refusal on it is genuine.
-    Fail-soft: any error returns the request unchanged.
+    Fail-soft: any error leaves the request unchanged.
     """
     if not isinstance(request, dict):
-        return {"request": request}
+        return None
     try:
         if _preprompt_enabled():
             session_id = _session_id_from_context(context)
@@ -327,7 +334,7 @@ def on_llm_request(request: Any, **context: Any) -> dict:
                     }
     except Exception as exc:
         logger.warning("refusal llm_request middleware error (fail-soft): %s", exc)
-    return {"request": request}
+    return None
 
 
 def _handle_refusal(request: Any, kwargs: Any) -> None:

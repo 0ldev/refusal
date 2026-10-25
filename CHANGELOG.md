@@ -17,6 +17,8 @@
 ### Fixed
 - **Quadratic backtracking on whitespace runs.** The shared sentence-start prefix `(?:^|[.!?\n]\s*)` was still quadratic after 0.1.1: a reply with 5,000 blank lines took ~3 s and 20,000 took ~50 s inside the synchronous middleware. It is now `\s{0,20}` (20,000 blank lines: ~0.1 s). Regression tests added.
 - Two of the new soft patterns flagged ordinary engineering replies ("I'm not comfortable writing to the production database…", "I have to say no to that flag…"); they now require a request-shaped object.
+- `llm_request` returned `{"request": request}` even when nothing changed, which made Hermes copy the payload again and record a spurious `source: plugin` trace entry on every request for every user. It now returns `None` for unchanged requests.
+- Session cleanup on `on_session_reset` used the new session id; it now drops the old one (`old_session_id`) as well as the finalizing one.
 - Post-call processing in `on_llm_execution` is fail-soft: an internal error is logged and the response is returned unchanged.
 
 ### Changed

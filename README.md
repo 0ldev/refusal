@@ -12,7 +12,7 @@ Some primary models decline legitimate work, such as security research, penetrat
 - **Refusal detection.** Direct refusals ("I can't help with that"), policy invocations ("this violates my guidelines"), softer phrasings ("I'm not comfortable providing that") and deflections ("I can't do X, but I can explain Y defensively").
 - **Provider-signalled refusals.** Responses the provider itself flags (Anthropic `stop_reason: refusal`, `finish_reason: content_filter`) are recognized even though they carry no text.
 - **Few false positives.** Tool-calling responses, code blocks, partial answers ("I can't do X, but here's Y") and idioms such as "can't help but" are treated as genuine answers. See [Limitations](#limitations) for what still gets through.
-- **Bounded cost.** Every pattern is length-bounded, and a reply with tens of thousands of blank lines is classified in milliseconds instead of stalling the agent.
+- **Bounded cost.** The lazy spans and sentence-start whitespace in the patterns are length-bounded, and a reply with tens of thousands of blank lines is classified in a fraction of a second instead of stalling the agent.
 - **Retry preprompt (opt-in, bring your own text).** You can configure text that is appended to the system prompt of requests after a refusal is detected in the session, so the fallback retry is not made on a bare prompt. The plugin ships no text of its own and does nothing here until you set one.
 - **Public APIs only.** It uses the `llm_execution` and `llm_request` middlewares and two observer hooks, and never patches Hermes core.
 - **No dependencies, no network calls.** Detection is local and rule-based.
@@ -58,7 +58,7 @@ fallback_providers:
     model: claude-haiku-4-5
 ```
 
-The retry preprompt and its controls are plugin settings under `plugins.entries.refusal.settings` (also editable in the Hermes settings UI). All of them are optional:
+The retry preprompt and its controls are plugin settings under `plugins.entries.refusal.settings` (the manifest declares a `config_schema`, so Hermes's settings form can render them). All of them are optional:
 
 | Setting | Type | Default | What it does |
 |---|---|---|---|
@@ -115,7 +115,7 @@ Each session has a *level*: 0 (unarmed), 1, or 2.
 
    Hermes moves on to the next fallback entry in every case. A refusal from a model the preprompt was not sent to (see `preprompt_models`) does not count as "despite the preprompt".
 4. With `preprompt_scope: turn` the level is forgotten when the next user turn starts. With `session` it lasts until the session is finalized or reset. If Hermes gives no `turn_id`, `turn` behaves like `session`.
-5. Armed state is dropped on `on_session_finalize` and `on_session_reset`. At most `max_armed_sessions` sessions are tracked; the least recently armed is evicted first.
+5. The ending session's armed state is dropped on `on_session_finalize` and `on_session_reset` (for a reset, the *old* session id). At most `max_armed_sessions` sessions are tracked; the least recently armed is evicted first.
 
 ### What happens on each outcome
 
@@ -188,6 +188,8 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 - **Cannot see the fallback chain.** Hermes does not tell middleware whether a fallback exists, so with none configured the plugin still marks and arms, and Hermes shows the safety notice.
 - **Same-model retries need a different route.** Hermes skips fallback entries that resolve to the backend that just failed (see below).
 - **State is per process.** Armed levels are not shared between gateway workers or processes, and they are lost on restart.
+- **Request copying.** Registering a `llm_request` middleware makes Hermes deep-copy each outgoing payload once or twice (about 1 ms for a 700 KB request in my measurement), whether or not you configured a preprompt. The plugin returns `None` for requests it does not change, so Hermes records no trace entry and makes no further copy for them.
+- **Context compression** starts a new session id with no link to the old one that plugins can see, so an armed session is unarmed after a compression. The orphaned entry is removed by the `max_armed_sessions` eviction.
 - **Streaming.** The middleware sees the finished response, so a refusal that streamed to the user is still shown before the fallback runs.
 - **Sub-agents** have their own session ids and are armed independently of their parent.
 - **Auxiliary calls** (compression, titles) never pass through the request middleware and are unaffected.

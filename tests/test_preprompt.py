@@ -39,9 +39,14 @@ def _request():
     }
 
 
+def _mw(request, **ctx):
+    """on_llm_request as Hermes applies it: a None result keeps the request as it was."""
+    return on_llm_request(request, **ctx) or {"request": request}
+
+
 def _round(session_id, response=None, **ctx):
     """One model call: request middleware, then the execution middleware over the effective request."""
-    effective = on_llm_request(_request(), session_id=session_id, **ctx)["request"]
+    effective = _mw(_request(), session_id=session_id, **ctx)["request"]
     out = on_llm_execution(
         next_call=lambda req: response if response is not None else _refusal_response(),
         request=effective, session_id=session_id, **ctx,
@@ -66,9 +71,9 @@ class TestMessageInjection:
             {"role": "system", "content": "You are a helper."},
             {"role": "user", "content": "hi"},
         ]
-        new_messages, changed = preprompt.inject_into_messages(messages, "KERNEL")
+        new_messages, changed = preprompt.inject_into_messages(messages, "TEXT")
         assert changed is True
-        assert new_messages[0]["content"] == "You are a helper.\n\nKERNEL"
+        assert new_messages[0]["content"] == "You are a helper.\n\nTEXT"
         assert new_messages[1] == {"role": "user", "content": "hi"}
         # input list and dicts are not mutated
         assert messages[0]["content"] == "You are a helper."
@@ -159,19 +164,19 @@ class TestArmingState:
 
 class TestRequestInjection:
     def test_no_injection_when_not_armed(self):
-        result = on_llm_request(_request(), session_id="s1")
+        result = _mw(_request(), session_id="s1")
         assert result["request"]["messages"][0]["content"] == "You are Hermes."
 
     def test_level_one_text_injected(self):
         _armed["s1"] = 1
-        result = on_llm_request(_request(), session_id="s1")
+        result = _mw(_request(), session_id="s1")
         system = result["request"]["messages"][0]["content"]
         assert system.startswith("You are Hermes.")
         assert LEVEL_ONE in system
 
     def test_level_two_text_injected(self):
         _armed["s1"] = 2
-        result = on_llm_request(_request(), session_id="s1")
+        result = _mw(_request(), session_id="s1")
         system = result["request"]["messages"][0]["content"]
         assert LEVEL_TWO in system
         assert LEVEL_ONE not in system
@@ -179,14 +184,14 @@ class TestRequestInjection:
     def test_original_request_not_mutated(self):
         request = _request()
         _armed["s1"] = 1
-        result = on_llm_request(request, session_id="s1")
+        result = _mw(request, session_id="s1")
         assert request["messages"][0]["content"] == "You are Hermes."
         assert LEVEL_ONE in result["request"]["messages"][0]["content"]
 
     def test_kill_switch_disables_injection(self, monkeypatch):
         monkeypatch.setenv("REFUSAL_PREPROMPT", "0")
         _armed["s1"] = 1
-        result = on_llm_request(_request(), session_id="s1")
+        result = _mw(_request(), session_id="s1")
         assert result["request"]["messages"][0]["content"] == "You are Hermes."
 
     def test_kill_switch_prevents_arming(self, monkeypatch):
@@ -214,7 +219,7 @@ class TestRequestInjection:
         on_llm_execution(next_call=next_call, request={}, session_id="s1")
         assert _armed == {}
         _armed["s1"] = 1
-        result = on_llm_request(_request(), session_id="s1")
+        result = _mw(_request(), session_id="s1")
         assert result["request"]["messages"][0]["content"] == "You are Hermes."
 
 
@@ -226,7 +231,7 @@ class TestEndToEndFlow:
 
         on_llm_execution(next_call=next_call, request=_request(), session_id="s1")
         # the fallback retry is a fresh request that passes through the middleware
-        retry = on_llm_request(_request(), session_id="s1")
+        retry = _mw(_request(), session_id="s1")
         system = retry["request"]["messages"][0]["content"]
         assert LEVEL_ONE in system
 
@@ -234,7 +239,7 @@ class TestEndToEndFlow:
         monkeypatch.setattr(plugin_mod, "_on_preprompt_refusal", "escalate")
         _round("s1")  # bare refusal -> level 1
         _round("s1")  # refused despite level-1 text -> level 2
-        retry = on_llm_request(_request(), session_id="s1")
+        retry = _mw(_request(), session_id="s1")
         system = retry["request"]["messages"][0]["content"]
         assert LEVEL_TWO in system
         assert LEVEL_ONE not in system
@@ -245,7 +250,7 @@ class TestProviderShapes:
 
     def _inject(self, request, api_mode):
         _armed["s1"] = 1
-        return on_llm_request(request, session_id="s1", api_mode=api_mode)["request"]
+        return _mw(request, session_id="s1", api_mode=api_mode)["request"]
 
     def test_anthropic_string_system(self):
         req = {"model": "claude", "system": "You are Hermes.", "messages": [{"role": "user", "content": "hi"}]}
@@ -286,7 +291,7 @@ class TestProviderShapes:
 
 
 class TestSessionLifecycle:
-    def test_disarm_hooks_forget_session(self):
+    def test_finalize_hook_forgets_the_ending_session(self):
         from refusal.plugin import _disarm_session
 
         _armed.update({"s1": 1, "s2": 2})
@@ -295,6 +300,14 @@ class TestSessionLifecycle:
         _disarm_session(session_id="missing")
         _disarm_session()
         assert _armed == {"s2": 2}
+
+    def test_reset_hook_forgets_the_old_session_not_the_new_one(self):
+        from refusal.plugin import _disarm_session
+
+        _armed.update({"old": 1, "other": 1})
+        # Hermes calls on_session_reset(session_id=<new>, old_session_id=<old>, new_session_id=<new>, ...)
+        _disarm_session(session_id="new", old_session_id="old", new_session_id="new", reason="new_session")
+        assert _armed == {"other": 1}
 
     def test_register_wires_cleanup_hooks_and_reads_settings(self):
         from unittest.mock import MagicMock
@@ -377,16 +390,16 @@ class TestRefusedDespitePreprompt:
 class TestScope:
     def test_turn_scope_forgets_on_next_turn(self):
         _round("s1", turn_id="t1")
-        same = on_llm_request(_request(), session_id="s1", turn_id="t1")["request"]
+        same = _mw(_request(), session_id="s1", turn_id="t1")["request"]
         assert LEVEL_ONE in _system(same)
-        nxt = on_llm_request(_request(), session_id="s1", turn_id="t2")["request"]
+        nxt = _mw(_request(), session_id="s1", turn_id="t2")["request"]
         assert LEVEL_ONE not in _system(nxt)
         assert "s1" not in _armed
 
     def test_session_scope_keeps_across_turns(self, monkeypatch):
         monkeypatch.setattr(plugin_mod, "_scope", "session")
         _round("s1", turn_id="t1")
-        nxt = on_llm_request(_request(), session_id="s1", turn_id="t2")["request"]
+        nxt = _mw(_request(), session_id="s1", turn_id="t2")["request"]
         assert LEVEL_ONE in _system(nxt)
 
 
@@ -401,7 +414,7 @@ class TestModelAllowlist:
     def test_matching(self, monkeypatch, patterns, provider, model, allowed):
         monkeypatch.setattr(plugin_mod, "_models", patterns)
         _armed["s1"] = 1
-        out = on_llm_request(_request(), session_id="s1", provider=provider, model=model)["request"]
+        out = _mw(_request(), session_id="s1", provider=provider, model=model)["request"]
         assert (LEVEL_ONE in _system(out)) is allowed
 
     def test_settings_parsing(self):
@@ -423,7 +436,7 @@ class TestModelAllowlist:
 class TestObservability:
     def test_trace_fields_on_injection(self):
         _armed["s1"] = 1
-        result = on_llm_request(_request(), session_id="s1")
+        result = _mw(_request(), session_id="s1")
         assert result["source"] == "refusal" and "level 1" in result["reason"]
 
     def test_no_session_id_logs_and_does_not_arm(self, caplog):
@@ -502,3 +515,29 @@ class TestRobustness:
         [t.start() for t in threads]
         [t.join() for t in threads]
         assert len(_armed) <= 50 and set(_armed) == set(plugin_mod._armed_turns)
+
+
+class TestUnchangedRequests:
+    """Returning None keeps Hermes from copying the payload and tracing a no-op."""
+
+    def test_none_when_unarmed(self):
+        assert on_llm_request(_request(), session_id="s1") is None
+
+    def test_none_when_feature_off(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_texts", ("", ""))
+        _armed["s1"] = 1
+        assert on_llm_request(_request(), session_id="s1") is None
+
+    def test_none_for_excluded_model_and_missing_session(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_models", ("google/*",))
+        _armed["s1"] = 1
+        assert on_llm_request(_request(), session_id="s1", provider="x", model="y") is None
+        assert on_llm_request(_request()) is None
+
+    def test_none_for_non_dict_request(self):
+        assert on_llm_request("not a dict", session_id="s1") is None
+
+    def test_none_on_internal_error(self, monkeypatch):
+        _armed["s1"] = 1
+        monkeypatch.setattr(preprompt, "inject_into_request", lambda *a, **k: 1 / 0)
+        assert on_llm_request(_request(), session_id="s1") is None
