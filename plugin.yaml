@@ -47,6 +47,11 @@ config_schema:
     default: []
     label: Models that may receive the preprompt
     description: "Glob patterns matched against model or provider/model (for example google/gemini-*). Empty allows any model"
+  arm_on_native_refusal:
+    type: bool
+    default: true
+    label: Arm on provider-signalled refusals
+    description: "Also treat a provider's own refusal signal (Anthropic stop_reason=refusal, finish_reason=content_filter) as a refusal for the retry preprompt, not only matched text"
   max_armed_sessions:
     type: int
     default: 1024

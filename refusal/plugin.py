@@ -48,6 +48,10 @@ _models: tuple[str, ...] = ()
 #: turn_id in which each armed session was last armed (for ``turn`` scope).
 _armed_turns: dict[str, str] = {}
 
+#: Also arm on provider-signalled refusals (``stop_reason=refusal``, ``finish_reason=content_filter``),
+#: which carry no matchable text. Hermes falls back on these by itself.
+_arm_on_native = True
+
 _TRUE = {"1", "on", "true", "yes"}
 _FALSE = {"0", "off", "false", "no"}
 
@@ -196,6 +200,24 @@ def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
         setattr(response, "incomplete_details", {"reason": "content_filter"})
 
 
+def _native_refusal_reason(response: Any) -> str:
+    """Why the provider itself flagged ``response`` as a refusal ('' when it did not)."""
+
+    def field(obj: Any, name: str) -> Any:
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+    if field(response, "stop_reason") == "refusal":
+        return "stop_reason=refusal"
+    choices = field(response, "choices")
+    if isinstance(choices, (list, tuple)) and choices:
+        if field(choices[0], "finish_reason") == "content_filter":
+            return "finish_reason=content_filter"
+    details = field(response, "incomplete_details")
+    if field(response, "status") == "incomplete" and field(details, "reason") == "content_filter":
+        return "status=incomplete (content_filter)"
+    return ""
+
+
 def _preprompt_enabled() -> bool:
     """True when the user configured a preprompt and has not switched it off.
 
@@ -334,6 +356,13 @@ def on_llm_execution(**kwargs: Any) -> Any:
     if _has_tool_calls(response):
         return response
 
+    native = _native_refusal_reason(response) if _arm_on_native else ""
+    if native:
+        # The provider already marked it, so Hermes will fall back; only record the refusal.
+        logger.info("provider-signalled refusal (%s)", native)
+        _handle_refusal(request, kwargs)
+        return response
+
     text = _extract_text_from_response(response)
     if text:
         detection = _detector.detect(text)
@@ -379,6 +408,20 @@ def _setting_choice(ctx: Any, key: str, choices: tuple[str, ...], default: str) 
     return value if value in choices else default
 
 
+def _setting_flag(ctx: Any, key: str, default: bool) -> bool:
+    """Read a boolean plugin setting (the default when absent or not a bool/flag string)."""
+    try:
+        value = ctx.get_config(key, default)
+    except Exception:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        return True if v in _TRUE else False if v in _FALSE else default
+    return default
+
+
 def _setting_models(ctx: Any) -> tuple[str, ...]:
     """Read ``preprompt_models`` (a list of glob patterns, or one comma-separated string)."""
     try:
@@ -394,12 +437,13 @@ def _setting_models(ctx: Any) -> tuple[str, ...]:
 
 def register(ctx: Any) -> None:
     """Register the middlewares and the session-cleanup hooks with Hermes."""
-    global _texts, _max_armed_sessions, _on_preprompt_refusal, _scope, _models
+    global _texts, _max_armed_sessions, _on_preprompt_refusal, _scope, _models, _arm_on_native
     _texts = (_setting_text(ctx, "preprompt"), _setting_text(ctx, "preprompt_escalated"))
     _max_armed_sessions = _setting_max_sessions(ctx)
     _on_preprompt_refusal = _setting_choice(ctx, "on_preprompt_refusal", _ON_REFUSAL_MODES, "disarm")
     _scope = _setting_choice(ctx, "preprompt_scope", _SCOPES, "turn")
     _models = _setting_models(ctx)
+    _arm_on_native = _setting_flag(ctx, "arm_on_native_refusal", True)
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware("llm_execution", on_llm_execution)
         ctx.register_middleware("llm_request", on_llm_request)

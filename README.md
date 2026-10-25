@@ -80,6 +80,7 @@ plugins:
         on_preprompt_refusal: disarm      # disarm | escalate | keep
         preprompt_scope: turn             # turn | session
         preprompt_models: []              # e.g. ["google/gemini-*"]; empty = any model
+        arm_on_native_refusal: true       # also arm on provider-signalled refusals
         max_armed_sessions: 1024
 ```
 
@@ -88,6 +89,7 @@ plugins:
 - **Per-provider injection.** The text goes where the provider reads its system prompt: the `system` message for chat completions, the top-level `system` field for Anthropic and Bedrock, and `instructions` for Responses/Codex.
 - **When the preprompt is refused too** (`on_preprompt_refusal`, default `disarm`): `disarm` stops sending it for the session, `escalate` switches to `preprompt_escalated` (or `preprompt` if empty), and `keep` leaves the level alone. Hermes moves on to the next fallback entry in every case, and the plugin logs `refused despite preprompt` at WARNING. A refusal from a model the preprompt was not sent to does not count.
 - **Scope** (`preprompt_scope`, default `turn`): with `turn` the armed level is forgotten when the next turn starts, so a false positive or a failed preprompt does not follow the session. With `session` it lasts until the session ends. Without a `turn_id` in the middleware context, `turn` behaves like `session`.
+- **Provider-signalled refusals** (`arm_on_native_refusal`, default `true`): a response the provider itself flags as a refusal (Anthropic `stop_reason: refusal`, `finish_reason: content_filter`, a Responses `incomplete` with `content_filter`) carries no matchable text, so it is also treated as a refusal for arming and for the "refused despite preprompt" handling. Hermes falls back on these by itself, and the plugin does not alter them.
 - **Which models** (`preprompt_models`): glob patterns matched against `model` or `provider/model`, case-insensitively. When set, the preprompt is only sent to matching models, so a final backup on another vendor never receives it.
 - **Cleanup.** Armed state is forgotten on `on_session_finalize` and `on_session_reset`, and at most `max_armed_sessions` sessions are tracked (default 1024; least recently armed evicted first).
 - **Observability.** Injected requests carry `source: refusal` and a `reason` in Hermes's middleware trace. The plugin logs arming, injection, `answered with preprompt` and `refused despite preprompt`.

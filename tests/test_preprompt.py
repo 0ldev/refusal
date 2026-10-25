@@ -429,3 +429,48 @@ class TestObservability:
             on_llm_execution(next_call=lambda r: _refusal_response(), request=_request())
         assert _armed == {}
         assert any("without a session_id" in r.message for r in caplog.records)
+
+
+class TestNativeRefusal:
+    @pytest.mark.parametrize("response", [
+        SimpleNamespace(content=[], stop_reason="refusal"),
+        {"content": [], "stop_reason": "refusal"},
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=""), finish_reason="content_filter")]),
+        {"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]},
+        SimpleNamespace(status="incomplete", incomplete_details={"reason": "content_filter"}, output=[]),
+    ])
+    def test_native_refusal_arms_without_text(self, response):
+        on_llm_execution(next_call=lambda r: response, request=_request(), session_id="s1")
+        assert _armed["s1"] == 1
+
+    def test_native_refusal_is_not_remarked_or_altered(self):
+        resp = SimpleNamespace(content=[], stop_reason="refusal")
+        out = on_llm_execution(next_call=lambda r: resp, request=_request(), session_id="s1")
+        assert out is resp and resp.stop_reason == "refusal"
+
+    def test_native_refusal_despite_preprompt_follows_mode(self):
+        resp = lambda: SimpleNamespace(content=[], stop_reason="refusal")
+        _round("s1", response=resp())  # level 1
+        _round("s1", response=resp())  # carried the text and was refused again
+        assert "s1" not in _armed       # default mode: disarm
+
+    def test_normal_stop_reasons_do_not_arm(self):
+        for resp in (SimpleNamespace(content=[], stop_reason="end_turn"), _benign_response()):
+            on_llm_execution(next_call=lambda r, resp=resp: resp, request=_request(), session_id="s1")
+        assert _armed == {}
+
+    def test_setting_off_ignores_native_signal(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_arm_on_native", False)
+        resp = SimpleNamespace(content=[], stop_reason="refusal")
+        on_llm_execution(next_call=lambda r: resp, request=_request(), session_id="s1")
+        assert _armed == {}
+
+    def test_flag_setting_parsing(self):
+        from unittest.mock import MagicMock
+
+        ctx = MagicMock()
+        for raw, expected in [(False, False), ("off", False), ("yes", True), (MagicMock(), True)]:
+            ctx.get_config.side_effect = lambda key, default=None, raw=raw: raw if key == "arm_on_native_refusal" else default
+            plugin_mod.register(ctx)
+            assert plugin_mod._arm_on_native is expected
+        plugin_mod._arm_on_native = True
