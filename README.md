@@ -19,7 +19,7 @@ Some primary models decline legitimate work, such as security research, penetrat
 
 ## Requirements
 
-- Hermes `>= 0.22.1` (the `requires_hermes` floor in `plugin.yaml`)
+- Hermes `>= 0.22.3` (the `requires_hermes` floor in `plugin.yaml`)
 - Python `>= 3.10`
 - At least one entry in `fallback_providers`. Without one, a detected refusal ends the turn (see [Behavior and disclosures](#behavior-and-disclosures)).
 
@@ -208,7 +208,6 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 - **Same-model retries need a different route.** Hermes skips fallback entries that resolve to the backend that just failed (see below).
 - **State is per process by default.** Armed levels are not shared between gateway workers or processes and are lost on restart, unless you enable [`persist_state`](#persistence-optional).
 - **Request copying.** Registering a `llm_request` middleware makes Hermes deep-copy each outgoing payload once or twice (about 1 ms for a 700 KB request in my measurement), whether or not you configured a preprompt. The plugin returns `None` for requests it does not change, so Hermes records no trace entry and makes no further copy for them.
-- **Hermes older than 0.22.4** has neither `post_compaction` nor `on_session_delete`: a context compression gives the session a new id, so an armed session is unarmed after it, and deleted sessions are only cleaned up by the `max_armed_sessions` eviction. From 0.22.4 both are handled.
 - **Streaming.** The middleware sees the finished response, so a refusal that streamed to the user is still shown before the fallback runs.
 - **Sub-agents** have their own session ids and are armed independently of their parent.
 - **Auxiliary calls** (compression, titles) never pass through the request middleware and are unaffected.
@@ -217,7 +216,7 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 
 ## Upgrading from 0.1.x
 
-0.2.0 adds the `llm_request` middleware, four session hooks (`on_session_finalize`, `on_session_reset`, `on_session_delete`, `post_compaction`) and the settings above. On Hermes older than 0.22.4 the last two are unknown to Hermes, which logs one warning at startup. With no `preprompt` configured, behavior is identical to 0.1.x except that provider-signalled refusals are now recorded (they were already handled by Hermes). Existing configuration keeps working. See the [changelog](CHANGELOG.md).
+0.2.0 adds the `llm_request` middleware, four session hooks (`on_session_finalize`, `on_session_reset`, `on_session_delete`, `post_compaction`) and the settings above. With no `preprompt` configured, behavior is identical to 0.1.x except that provider-signalled refusals are now recorded (they were already handled by Hermes). Existing configuration keeps working. See the [changelog](CHANGELOG.md).
 
 ## Library usage
 

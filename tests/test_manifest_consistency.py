@@ -82,5 +82,5 @@ def test_env_kill_switch_name_is_documented():
 
 def test_requires_hermes_floor_is_consistent_and_semver():
     floors = re.findall(r'requires_hermes:\s*"([^"]+)"', MANIFEST)
-    assert floors == [">=0.22.1"] and re.fullmatch(r">=\d+\.\d+(\.\d+)?", floors[0])
-    assert "0.22.1" in README
+    assert floors == [">=0.22.3"] and re.fullmatch(r">=\d+\.\d+(\.\d+)?", floors[0])
+    assert "0.22.3" in README

@@ -338,7 +338,7 @@ def _disarm_session(session_id: str = "", old_session_id: str = "", **_: Any) ->
 
 
 def _on_session_delete(session_id: str = "", deleted_ids: Any = None, **_: Any) -> None:
-    """Forget deleted or archived sessions (``on_session_delete``; Hermes 0.22.4+)."""
+    """Forget deleted or archived sessions (``on_session_delete``; Hermes 0.22.3+)."""
     ids = [session_id] + [d for d in (deleted_ids if isinstance(deleted_ids, (list, tuple)) else ()) if d]
     for sid in ids:
         if sid:
@@ -347,7 +347,7 @@ def _on_session_delete(session_id: str = "", deleted_ids: Any = None, **_: Any) 
 
 
 def _on_compaction(session_id: str = "", old_session_id: str = "", **_: Any) -> None:
-    """Carry an armed level over when compaction rotates the session id (``post_compaction``; 0.22.4+).
+    """Carry an armed level over when compaction rotates the session id (``post_compaction``; Hermes 0.22.3+).
 
     ``old_session_id`` is empty when the transcript was compacted in place, in which case the id
     did not change and there is nothing to move.
@@ -602,6 +602,6 @@ def register(ctx: Any) -> None:
     if hasattr(ctx, "register_hook"):
         ctx.register_hook("on_session_finalize", _disarm_session)
         ctx.register_hook("on_session_reset", _disarm_session)
-        # Hermes 0.22.4+ only: older versions log "unknown hook" for these two and never call them.
+        # Valid hook names from Hermes 0.22.3, which is the requires_hermes floor.
         ctx.register_hook("on_session_delete", _on_session_delete)
         ctx.register_hook("post_compaction", _on_compaction)

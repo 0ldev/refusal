@@ -10,7 +10,7 @@ tags:
   - safety
   - refusal
   - routing
-requires_hermes: ">=0.22.1"
+requires_hermes: ">=0.22.3"
 capabilities: []
 provides_middleware:
   - llm_execution
