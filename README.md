@@ -198,7 +198,8 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 - **Fallback costs tokens.** Hermes resends the full conversation to the fallback model, and the fallback provider bills for it.
 - **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback provider.
 - **Persistence is opt-in.** With `persist_state: true` the plugin reads and writes its own file in Hermes's plugin state directory (session ids, levels and turn ids only; see [Persistence](#persistence-optional)). With it off, the plugin writes nothing to disk.
-- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package (and, if enabled, its own plugin state) and stores no credentials. Armed state lives in process memory only, unless you opt in to `persist_state` (below).
+- **One environment variable is read.** `REFUSAL_PREPROMPT` (the kill switch), at call time. It is not a credential and is never written.
+- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads no files outside its own package (and, if enabled, its own plugin state) and stores no credentials. Armed state lives in process memory only, unless you opt in to `persist_state` (below).
 
 ## Limitations
 

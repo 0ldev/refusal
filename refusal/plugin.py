@@ -110,6 +110,23 @@ def _has_tool_calls(response: Any) -> bool:
     return False
 
 
+def _content_to_text(content: Any) -> str:
+    """Flatten message content: a string, or a list of text parts/blocks (OpenAI parts, Anthropic blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return " \n".join(parts)
+    return ""
+
+
 def _extract_text_from_response(response: Any) -> str:
     """Extract assistant text content from various response shapes (OpenAI, SimpleNamespace, dict, Anthropic)."""
     if response is None:
@@ -124,11 +141,11 @@ def _extract_text_from_response(response: Any) -> str:
             choice = choices[0]
             msg = choice.get("message")
             if isinstance(msg, dict):
-                return msg.get("content") or ""
+                return _content_to_text(msg.get("content"))
             if isinstance(msg, str):
                 return msg
-            return choice.get("text") or ""
-        return response.get("content") or ""
+            return _content_to_text(choice.get("text"))
+        return _content_to_text(response.get("content"))
 
     choices = getattr(response, "choices", None)
     if choices and len(choices) > 0:
@@ -137,30 +154,16 @@ def _extract_text_from_response(response: Any) -> str:
         if message is not None:
             content = getattr(message, "content", None)
             if content is not None:
-                return content
+                return _content_to_text(content)
             if isinstance(message, dict):
-                return message.get("content") or ""
+                return _content_to_text(message.get("content"))
         choice_text = getattr(choice, "text", None)
         if choice_text is not None:
-            return choice_text
+            return _content_to_text(choice_text)
         if isinstance(choice, dict):
-            return choice.get("text") or ""
+            return _content_to_text(choice.get("text"))
 
-    content = getattr(response, "content", None)
-    if content is not None and isinstance(content, str):
-        return content
-
-    if hasattr(response, "content") and isinstance(response.content, list):
-        parts: list[str] = []
-        for block in response.content:
-            if hasattr(block, "text") and block.text:
-                parts.append(block.text)
-            elif isinstance(block, dict) and block.get("text"):
-                parts.append(block["text"])
-        if parts:
-            return " \n".join(parts)
-
-    return ""
+    return _content_to_text(getattr(response, "content", None))
 
 
 def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
@@ -372,9 +375,10 @@ def on_llm_request(request: Any, **context: Any) -> dict | None:
         if _preprompt_enabled():
             session_id = _session_id_from_context(context)
             level = _current_level(session_id, str(context.get("turn_id") or "")) if session_id else 0
-            if level >= 1 and _model_allowed(context):
+            text = preprompt.preprompt_text(level, _texts)
+            if level >= 1 and _model_allowed(context) and not preprompt.request_contains(request, text):
                 new_request, changed = preprompt.inject_into_request(
-                    request, preprompt.preprompt_text(level, _texts), str(context.get("api_mode") or "")
+                    request, text, str(context.get("api_mode") or "")
                 )
                 if changed:
                     logger.info(

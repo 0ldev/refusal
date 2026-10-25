@@ -639,3 +639,11 @@ class TestPersistence:
         assert plugin_mod._persist is False
         assert any("not writable" in r.message or "unreadable" in r.message for r in caplog.records)
         assert plugin_mod._peek_level("s2") == 1
+
+
+class TestNoDoubleInjection:
+    def test_a_request_already_carrying_the_text_is_left_alone(self):
+        _armed["s1"] = 1
+        once = _mw(_request(), session_id="s1")["request"]
+        assert on_llm_request(once, session_id="s1") is None
+        assert _system(once).count(LEVEL_ONE) == 1
