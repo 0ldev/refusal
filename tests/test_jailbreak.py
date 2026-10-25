@@ -298,7 +298,18 @@ class TestSessionLifecycle:
     def test_armed_table_is_bounded(self, monkeypatch):
         from refusal import plugin
 
-        monkeypatch.setattr(plugin, "_MAX_ARMED_SESSIONS", 3)
+        monkeypatch.setattr(plugin, "_max_armed_sessions", 3)
         for i in range(5):
             plugin._arm_session(f"s{i}")
         assert list(_armed) == ["s2", "s3", "s4"]
+
+    def test_cap_comes_from_setting_and_rejects_bad_values(self):
+        from unittest.mock import MagicMock
+        from refusal import plugin
+
+        ctx = MagicMock()
+        for raw, expected in [(50, 50), (0, 1024), (-3, 1024), (True, 1024), ("9", 1024), (MagicMock(), 1024)]:
+            ctx.get_config.side_effect = lambda key, default=None, raw=raw: raw if key == "max_armed_sessions" else False
+            plugin.register(ctx)
+            assert plugin._max_armed_sessions == expected
+        plugin._max_armed_sessions = plugin.DEFAULT_MAX_ARMED_SESSIONS

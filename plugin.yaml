@@ -28,3 +28,8 @@ config_schema:
     label: Jailbreak kernel
     description: "Opt in to appending a no-refusal directive to the system prompt of requests after a refusal is detected in the session"
 requires_env: []
+  max_armed_sessions:
+    type: int
+    default: 1024
+    label: Max armed sessions
+    description: "How many sessions with an active kernel level are tracked at once; the least recently armed is forgotten first"

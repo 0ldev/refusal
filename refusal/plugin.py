@@ -23,8 +23,10 @@ _detector = RefusalDetector()
 _armed: OrderedDict[str, int] = OrderedDict()
 _armed_lock = threading.Lock()
 
-#: Upper bound on tracked sessions; the least recently armed entry is evicted first.
-_MAX_ARMED_SESSIONS = 1024
+#: Default upper bound on tracked sessions; the least recently armed entry is evicted
+#: first. Overridable with the ``max_armed_sessions`` plugin setting.
+DEFAULT_MAX_ARMED_SESSIONS = 1024
+_max_armed_sessions = DEFAULT_MAX_ARMED_SESSIONS
 
 #: Opt-in switch from the ``jailbreak_kernel`` plugin setting, captured in register().
 _config_enabled = False
@@ -203,7 +205,7 @@ def _arm_session(session_id: str) -> int:
         level = min(_armed.get(session_id, 0) + 1, kernel.MAX_LEVEL)
         _armed[session_id] = level
         _armed.move_to_end(session_id)
-        while len(_armed) > _MAX_ARMED_SESSIONS:
+        while len(_armed) > _max_armed_sessions:
             _armed.popitem(last=False)
     return level
 
@@ -280,10 +282,22 @@ def _setting_enabled(ctx: Any) -> bool:
     return isinstance(value, str) and value.strip().lower() in _TRUE
 
 
+def _setting_max_sessions(ctx: Any) -> int:
+    """Read ``max_armed_sessions`` (a positive int), falling back to the default."""
+    try:
+        value = ctx.get_config("max_armed_sessions", DEFAULT_MAX_ARMED_SESSIONS)
+    except Exception:
+        return DEFAULT_MAX_ARMED_SESSIONS
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return DEFAULT_MAX_ARMED_SESSIONS
+    return value
+
+
 def register(ctx: Any) -> None:
     """Register the middlewares and the session-cleanup hooks with Hermes."""
-    global _config_enabled
+    global _config_enabled, _max_armed_sessions
     _config_enabled = _setting_enabled(ctx)
+    _max_armed_sessions = _setting_max_sessions(ctx)
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware("llm_execution", on_llm_execution)
         ctx.register_middleware("llm_request", on_llm_request)
