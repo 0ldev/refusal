@@ -54,8 +54,10 @@ def _clear_armed_state(monkeypatch):
     monkeypatch.delenv("REFUSAL_PREPROMPT", raising=False)
     monkeypatch.setattr(plugin_mod, "_texts", (LEVEL_ONE, LEVEL_TWO))
     _armed.clear()
+    plugin_mod._armed_turns.clear()
     yield
     _armed.clear()
+    plugin_mod._armed_turns.clear()
 
 
 class TestMessageInjection:
@@ -474,3 +476,29 @@ class TestNativeRefusal:
             plugin_mod.register(ctx)
             assert plugin_mod._arm_on_native is expected
         plugin_mod._arm_on_native = True
+
+
+class TestRobustness:
+    def test_internal_error_returns_the_response_untouched(self, monkeypatch):
+        resp = _refusal_response()
+
+        def boom(*a, **k):
+            raise RuntimeError("detector exploded")
+
+        monkeypatch.setattr(plugin_mod._detector, "detect", boom)
+        out = on_llm_execution(next_call=lambda r: resp, request=_request(), session_id="s1")
+        assert out is resp and resp.choices[0].finish_reason == "stop"
+
+    def test_concurrent_arming_respects_the_cap(self, monkeypatch):
+        import threading
+
+        monkeypatch.setattr(plugin_mod, "_max_armed_sessions", 50)
+
+        def work(n):
+            for i in range(200):
+                plugin_mod._arm_session(f"t{n}-{i}")
+
+        threads = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert len(_armed) <= 50 and set(_armed) == set(plugin_mod._armed_turns)

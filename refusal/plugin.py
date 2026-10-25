@@ -234,25 +234,34 @@ def _session_id_from_context(kwargs: Any) -> str:
     return str(kwargs.get("session_id") or "")
 
 
+def _set_level_locked(session_id: str, level: int, turn_id: str = "") -> None:
+    """Record a session's level (0 removes it); evicts the least recently armed over the cap.
+
+    The caller holds ``_armed_lock``.
+    """
+    if level <= 0:
+        _armed.pop(session_id, None)
+        _armed_turns.pop(session_id, None)
+        return
+    _armed[session_id] = level
+    _armed.move_to_end(session_id)
+    _armed_turns[session_id] = turn_id
+    while len(_armed) > _max_armed_sessions:
+        evicted, _ = _armed.popitem(last=False)
+        _armed_turns.pop(evicted, None)
+
+
 def _set_level(session_id: str, level: int, turn_id: str = "") -> None:
-    """Record a session's level (0 removes it); evicts the least recently armed over the cap."""
+    """Locking wrapper around :func:`_set_level_locked`."""
     with _armed_lock:
-        if level <= 0:
-            _armed.pop(session_id, None)
-            _armed_turns.pop(session_id, None)
-            return
-        _armed[session_id] = level
-        _armed.move_to_end(session_id)
-        _armed_turns[session_id] = turn_id
-        while len(_armed) > _max_armed_sessions:
-            evicted, _ = _armed.popitem(last=False)
-            _armed_turns.pop(evicted, None)
+        _set_level_locked(session_id, level, turn_id)
 
 
 def _arm_session(session_id: str, turn_id: str = "") -> int:
     """Raise the session's level by one (capped) and return the new level."""
-    level = min(_armed.get(session_id, 0) + 1, preprompt.MAX_LEVEL)
-    _set_level(session_id, level, turn_id)
+    with _armed_lock:
+        level = min(_armed.get(session_id, 0) + 1, preprompt.MAX_LEVEL)
+        _set_level_locked(session_id, level, turn_id)
     return level
 
 
@@ -269,6 +278,12 @@ def _model_allowed(context: Any) -> bool:
     provider = str(context.get("provider") or "").lower()
     names = {model, f"{provider}/{model}"}
     return any(fnmatch.fnmatchcase(n, pat) for pat in _models for n in names)
+
+
+def _peek_level(session_id: str) -> int:
+    """The session's stored level without applying ``turn`` scope."""
+    with _armed_lock:
+        return _armed.get(session_id, 0)
 
 
 def _current_level(session_id: str, turn_id: str) -> int:
@@ -345,7 +360,11 @@ def _handle_refusal(request: Any, kwargs: Any) -> None:
 
 
 def on_llm_execution(**kwargs: Any) -> Any:
-    """Run the model call, then flag refusals as content_filter to trigger fallback."""
+    """Run the model call, then flag refusals as content_filter to trigger fallback.
+
+    Everything after the provider call is fail-soft: an error in detection or in the
+    preprompt bookkeeping is logged and the response is returned as received.
+    """
     next_call = kwargs.get("next_call")
     request = kwargs.get("request")
     response = next_call(request) if next_call else None
@@ -353,29 +372,37 @@ def on_llm_execution(**kwargs: Any) -> Any:
     if response is None:
         return response
 
+    try:
+        _inspect_response(request, response, kwargs)
+    except Exception as exc:
+        logger.warning("refusal llm_execution middleware error (fail-soft): %s", exc)
+    return response
+
+
+def _inspect_response(request: Any, response: Any, kwargs: Any) -> None:
+    """Detect a refusal in ``response``, update the session level and mark it for failover."""
     if _has_tool_calls(response):
-        return response
+        return
 
     native = _native_refusal_reason(response) if _arm_on_native else ""
     if native:
         # The provider already marked it, so Hermes will fall back; only record the refusal.
         logger.info("provider-signalled refusal (%s)", native)
         _handle_refusal(request, kwargs)
-        return response
+        return
 
     text = _extract_text_from_response(response)
-    if text:
-        detection = _detector.detect(text)
-        if detection.is_refusal:
-            _handle_refusal(request, kwargs)
-            _mark_as_refusal(response, detection)
-        elif _preprompt_enabled() and preprompt.request_contains(
-            request, preprompt.preprompt_text(_armed.get(_session_id_from_context(kwargs), 0), _texts)
-        ):
-            logger.info("answered with preprompt (session=%s provider=%s model=%s)",
-                        _session_id_from_context(kwargs), kwargs.get("provider"), kwargs.get("model"))
-
-    return response
+    if not text:
+        return
+    detection = _detector.detect(text)
+    if detection.is_refusal:
+        _handle_refusal(request, kwargs)
+        _mark_as_refusal(response, detection)
+    elif _preprompt_enabled() and preprompt.request_contains(
+        request, preprompt.preprompt_text(_peek_level(_session_id_from_context(kwargs)) or 1, _texts)
+    ):
+        logger.info("answered with preprompt (session=%s provider=%s model=%s)",
+                    _session_id_from_context(kwargs), kwargs.get("provider"), kwargs.get("model"))
 
 
 def _setting_text(ctx: Any, key: str) -> str:

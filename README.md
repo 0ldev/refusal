@@ -9,10 +9,12 @@ Some primary models decline legitimate work, such as security research, penetrat
 
 ## Features
 
-- **Refusal detection.** Direct refusals ("I can't help with that"), policy invocations ("this violates my guidelines") and deflections ("I can't do X, but I can explain Y defensively").
-- **Few false positives.** Tool-calling responses, code blocks, partial answers ("I can't do X, but here's Y") and idioms such as "can't help but" are all treated as genuine answers.
+- **Refusal detection.** Direct refusals ("I can't help with that"), policy invocations ("this violates my guidelines"), softer phrasings ("I'm not comfortable providing that") and deflections ("I can't do X, but I can explain Y defensively").
+- **Provider-signalled refusals.** Responses the provider itself flags (Anthropic `stop_reason: refusal`, `finish_reason: content_filter`) are recognized even though they carry no text.
+- **Few false positives.** Tool-calling responses, code blocks, partial answers ("I can't do X, but here's Y") and idioms such as "can't help but" are treated as genuine answers. See [Limitations](#limitations) for what still gets through.
+- **Bounded cost.** Every pattern is length-bounded, and a reply with tens of thousands of blank lines is classified in milliseconds instead of stalling the agent.
 - **Retry preprompt (opt-in, bring your own text).** You can configure text that is appended to the system prompt of requests after a refusal is detected in the session, so the fallback retry is not made on a bare prompt. The plugin ships no text of its own and does nothing here until you set one.
-- **Public APIs only.** It uses the `llm_execution` and `llm_request` middlewares and never patches Hermes core.
+- **Public APIs only.** It uses the `llm_execution` and `llm_request` middlewares and two observer hooks, and never patches Hermes core.
 - **No dependencies, no network calls.** Detection is local and rule-based.
 
 ## Requirements
@@ -44,7 +46,7 @@ hermes plugins capabilities refusal
 
 ## Configuration
 
-The plugin has no settings of its own. Configure the fallback chain in `~/.hermes/config.yaml` (or with `hermes fallback add`):
+Out of the box the plugin only needs a fallback chain, configured in `~/.hermes/config.yaml` (or with `hermes fallback add`):
 
 ```yaml
 model:
@@ -55,6 +57,20 @@ fallback_providers:
   - provider: anthropic
     model: claude-haiku-4-5
 ```
+
+The retry preprompt and its controls are plugin settings under `plugins.entries.refusal.settings` (also editable in the Hermes settings UI). All of them are optional:
+
+| Setting | Type | Default | What it does |
+|---|---|---|---|
+| `preprompt` | string | empty | Text appended to the system prompt after a refusal. Empty turns the whole preprompt feature off. |
+| `preprompt_escalated` | string | empty | Text used instead of `preprompt` once the preprompt itself was refused (only with `on_preprompt_refusal: escalate`). Empty reuses `preprompt`. |
+| `on_preprompt_refusal` | `disarm` \| `escalate` \| `keep` | `disarm` | What a refusal that happened *with* the preprompt does to the session. |
+| `preprompt_scope` | `turn` \| `session` | `turn` | How long a session stays armed. |
+| `preprompt_models` | list of globs | empty (any) | Only send the preprompt to matching `model` or `provider/model` names. |
+| `arm_on_native_refusal` | bool | `true` | Also arm on provider-signalled refusals. |
+| `max_armed_sessions` | int ≥ 1 | `1024` | How many armed sessions are tracked at once. |
+
+Environment: `REFUSAL_PREPROMPT=0` (or `off`, `false`, `no`) disables arming and injection regardless of the settings. It is read at call time, so it works without a restart.
 
 ## How it works
 
@@ -80,21 +96,61 @@ plugins:
         on_preprompt_refusal: disarm      # disarm | escalate | keep
         preprompt_scope: turn             # turn | session
         preprompt_models: []              # e.g. ["google/gemini-*"]; empty = any model
-        arm_on_native_refusal: true       # also arm on provider-signalled refusals
+        arm_on_native_refusal: true
         max_armed_sessions: 1024
 ```
 
-- **Nothing is bundled.** Both settings default to empty, and with `preprompt` empty requests are never modified. `preprompt_escalated` falls back to `preprompt` when empty.
-- **Detection arms the session.** A refusal on a request that did not carry the preprompt sets the session to level 1. An `llm_request` middleware then appends the text for the current level to the system prompt of later requests, including the fallback retry. The first call of a turn in an unarmed session is untouched.
-- **Per-provider injection.** The text goes where the provider reads its system prompt: the `system` message for chat completions, the top-level `system` field for Anthropic and Bedrock, and `instructions` for Responses/Codex.
-- **When the preprompt is refused too** (`on_preprompt_refusal`, default `disarm`): `disarm` stops sending it for the session, `escalate` switches to `preprompt_escalated` (or `preprompt` if empty), and `keep` leaves the level alone. Hermes moves on to the next fallback entry in every case, and the plugin logs `refused despite preprompt` at WARNING. A refusal from a model the preprompt was not sent to does not count.
-- **Scope** (`preprompt_scope`, default `turn`): with `turn` the armed level is forgotten when the next turn starts, so a false positive or a failed preprompt does not follow the session. With `session` it lasts until the session ends. Without a `turn_id` in the middleware context, `turn` behaves like `session`.
-- **Provider-signalled refusals** (`arm_on_native_refusal`, default `true`): a response the provider itself flags as a refusal (Anthropic `stop_reason: refusal`, `finish_reason: content_filter`, a Responses `incomplete` with `content_filter`) carries no matchable text, so it is also treated as a refusal for arming and for the "refused despite preprompt" handling. Hermes falls back on these by itself, and the plugin does not alter them.
-- **Which models** (`preprompt_models`): glob patterns matched against `model` or `provider/model`, case-insensitively. When set, the preprompt is only sent to matching models, so a final backup on another vendor never receives it.
-- **Cleanup.** Armed state is forgotten on `on_session_finalize` and `on_session_reset`, and at most `max_armed_sessions` sessions are tracked (default 1024; least recently armed evicted first).
-- **Observability.** Injected requests carry `source: refusal` and a `reason` in Hermes's middleware trace. The plugin logs arming, injection, `answered with preprompt` and `refused despite preprompt`.
-- **Kill switch.** `REFUSAL_PREPROMPT=0` disables arming and injection regardless of the settings (read at call time). Detection and fallback routing still work.
-- **Your responsibility.** What you put in the preprompt is sent to your model provider, and you are responsible for complying with that provider's usage policy.
+You are responsible for the text you configure: it is sent to your model provider, and you must comply with that provider's usage policy.
+
+### Lifecycle
+
+Each session has a *level*: 0 (unarmed), 1, or 2.
+
+1. A refusal on a request that did **not** carry the preprompt sets the session to level 1.
+2. An `llm_request` middleware appends the text for the current level to the system prompt of later requests in the session, including the fallback retry. The first call of a turn in an unarmed session is untouched, so a refusal on it is genuine.
+3. If a request that **did** carry the preprompt is refused too, `on_preprompt_refusal` decides:
+   - `disarm`: back to level 0, the preprompt is no longer sent.
+   - `escalate`: level 2, which sends `preprompt_escalated` (or `preprompt` if empty).
+   - `keep`: the level stays as it is.
+
+   Hermes moves on to the next fallback entry in every case. A refusal from a model the preprompt was not sent to (see `preprompt_models`) does not count as "despite the preprompt".
+4. With `preprompt_scope: turn` the level is forgotten when the next user turn starts. With `session` it lasts until the session is finalized or reset. If Hermes gives no `turn_id`, `turn` behaves like `session`.
+5. Armed state is dropped on `on_session_finalize` and `on_session_reset`. At most `max_armed_sessions` sessions are tracked; the least recently armed is evicted first.
+
+### What happens on each outcome
+
+| Situation | Plugin does | Hermes does |
+|---|---|---|
+| Text refusal, no preprompt sent | Marks `content_filter`, level → 1 | Falls back to the next chain entry |
+| Provider-signalled refusal, no preprompt sent | Level → 1 (response untouched) | Falls back |
+| Refusal despite the preprompt | Marks it, applies `on_preprompt_refusal` | Falls back; with no entry left, shows the safety notice |
+| Normal answer on an armed request | Logs `answered with preprompt`, level unchanged | Continues |
+| Tool-call response | Ignored | Continues |
+| Refusal with no `session_id` | Marks it, does not arm | Falls back |
+| No fallback configured | Arms anyway (it cannot see the chain) | Shows the safety notice |
+
+### Where the text goes
+
+The text is added where each provider reads its system prompt: the `system` message for chat completions, the top-level `system` field for Anthropic and Bedrock (string or text blocks; existing blocks and their `cache_control` markers are left intact), and `instructions` for Responses/Codex. The text is never stored, and the original request object is never mutated.
+
+### Models
+
+`preprompt_models` takes case-insensitive globs matched against the model name or `provider/model`, for example `["google/gemini-*", "claude-*"]`. When set, the preprompt is only sent to matching models, so a last-resort backup on another vendor never receives it.
+
+### Logs and traces
+
+| Level | Message | Meaning |
+|---|---|---|
+| WARNING | `Refusal detected (kind=…, reason=…, text=…)` | A text refusal was matched and the response marked |
+| INFO | `provider-signalled refusal (…)` | The provider flagged the response itself |
+| INFO | `preprompt armed (session=… level=1)` | First refusal in the session |
+| INFO | `preprompt injected (session=… level=… provider=… model=…)` | A request was modified |
+| INFO | `answered with preprompt (…)` | A request that carried the preprompt got a normal answer |
+| WARNING | `refused despite preprompt (…); mode=… -> level …` | The preprompt did not help |
+| INFO | `refused without preprompt (…); level unchanged` | Armed session, but this request was not sent the text (model filter or scope) |
+| INFO | `refusal detected without a session_id; preprompt not armed` | Hermes gave no session id |
+
+Injected requests also carry `source: refusal` and a `reason` in Hermes's middleware trace.
 
 ### Reaching the same model on the retry
 
@@ -119,11 +175,28 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 ## Behavior and disclosures
 
 - **Every turn is inspected.** The middleware reads each model response before the agent loop uses it. Nothing is stored or sent anywhere.
-- **Responses are modified.** A detected refusal changes the response metadata (`finish_reason`, `stop_reason`) so that Hermes triggers failover.
-- **Requests are modified (only when you set a preprompt).** For armed sessions your preprompt text is appended to the system prompt of outgoing requests. It is not stored and is sent only to the model being called.
+- **Responses are modified.** A detected text refusal changes the response metadata (`finish_reason`, `stop_reason`) so that Hermes triggers failover. Provider-signalled refusals are not altered.
+- **Requests are modified (only when you set a preprompt).** For armed sessions your preprompt text is appended to the system prompt of outgoing requests.
+- **The matched snippet is logged.** A detected refusal logs the matching part of the response at WARNING. Your preprompt text is never logged.
 - **Fallback costs tokens.** Hermes resends the full conversation to the fallback model, and the fallback provider bills for it.
 - **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback provider.
-- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package and stores no credentials.
+- The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package and stores no credentials. Armed state lives in process memory only.
+
+## Limitations
+
+- **Pattern-based.** An unusual refusal phrasing can be missed, and a reply that quotes refusal language can be flagged. Plain statements of technical inability ("I'm not able to run that because the container has no network") can also match; configure a fallback so a false positive does not discard the answer.
+- **Cannot see the fallback chain.** Hermes does not tell middleware whether a fallback exists, so with none configured the plugin still marks and arms, and Hermes shows the safety notice.
+- **Same-model retries need a different route.** Hermes skips fallback entries that resolve to the backend that just failed (see below).
+- **State is per process.** Armed levels are not shared between gateway workers or processes, and they are lost on restart.
+- **Streaming.** The middleware sees the finished response, so a refusal that streamed to the user is still shown before the fallback runs.
+- **Sub-agents** have their own session ids and are armed independently of their parent.
+- **Auxiliary calls** (compression, titles) never pass through the request middleware and are unaffected.
+- **Prompt caching.** On Anthropic, arming adds a small uncached block after the cached system prefix. In a live test with an ~8.6k-token cached system prompt, the first armed request wrote 21 new cache tokens and read the rest from cache; the cached prefix stayed warm. Long histories with several message-level cache breakpoints were not measured.
+- **Tested against.** Anthropic (live, OAuth, `claude-haiku-4-5`). The OpenAI-compatible, Bedrock and Responses/Codex request shapes are covered by unit tests only.
+
+## Upgrading from 0.1.x
+
+0.2.0 adds the `llm_request` middleware, two session hooks (`on_session_finalize`, `on_session_reset`) and the settings above. With no `preprompt` configured, behavior is identical to 0.1.x except that provider-signalled refusals are now recorded (they were already handled by Hermes). Existing configuration keeps working. See the [changelog](CHANGELOG.md).
 
 ## Library usage
 
@@ -149,6 +222,8 @@ python -m pip install -e . pytest
 pytest
 ```
 
+The tests cover the detector (including timing bounds), the fallback marking, and the preprompt state machine, injection shapes and settings parsing.
+
 Validate the packaging against the Hermes catalog rules:
 
 ```bash
@@ -160,6 +235,7 @@ hermes plugins doctor . --ci
 
 ```text
 plugin.yaml            Hermes manifest
+CHANGELOG.md           Release notes
 __init__.py            Plugin entry point (exports register)
 refusal/
   detector.py          RefusalDetector and DetectionResult
