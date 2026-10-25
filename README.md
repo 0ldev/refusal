@@ -11,7 +11,7 @@ Some primary models decline legitimate work, such as security research, penetrat
 
 - **Refusal detection.** Direct refusals ("I can't help with that"), policy invocations ("this violates my guidelines") and deflections ("I can't do X, but I can explain Y defensively").
 - **Few false positives.** Tool-calling responses, code blocks, partial answers ("I can't do X, but here's Y") and idioms such as "can't help but" are all treated as genuine answers.
-- **Jailbreak kernel (opt-in).** A detected refusal arms a per-session kernel; the fallback retry (and later requests in the session) get a direct-output directive appended to their system message, so the second call on the same model is made with a preprompt.
+- **Retry preprompt (opt-in, bring your own text).** You can configure text that is appended to the system prompt of requests after a refusal is detected in the session, so the fallback retry is not made on a bare prompt. The plugin ships no text of its own and does nothing here until you set one.
 - **Public APIs only.** It uses the `llm_execution` and `llm_request` middlewares and never patches Hermes core.
 - **No dependencies, no network calls.** Detection is local and rule-based.
 
@@ -66,15 +66,25 @@ fallback_providers:
 
 Hermes does not let plugins register custom failover reasons, so a detected refusal appears under Hermes's own `content_policy_blocked` reason.
 
-## Jailbreak kernel (preprompt on the second call)
+## Retry preprompt (optional)
 
-When a model refuses, `refusal` can arm a **jailbreak kernel** for the session so the retry is not made on a bare prompt:
+By default a refusal only triggers the fallback. If you set a preprompt, the retry is also made with your text in the system prompt:
 
-- **Detection arms the kernel.** A detected refusal raises the session's kernel level before the response is marked `content_filter`: level 1 = `core` directive (direct-output deliverable contract), level 2 = `max` override (hard no-refusal). Further refusals keep the session at `max`.
-- **Request-layer injection.** An `llm_request` middleware appends the active kernel text to the last system message of every outgoing request for an armed session. The first call of a turn (level 0) is untouched, so a refusal on it is genuine; the fallback retry — a fresh request that passes through the same middleware — carries the preprompt.
-- **Opt-in.** The kernel is off by default. Enable it with the `jailbreak_kernel` plugin setting (`plugins.entries.refusal.settings.jailbreak_kernel: true`) or the `REFUSAL_JAILBREAK` environment variable (`1` enables, `0` disables and overrides the setting; read at call time). With it off, detection and fallback routing work as before and requests are never modified.
-- **Per-provider injection.** The kernel goes where the provider reads its system prompt: the `system` message for chat completions, the top-level `system` field for Anthropic and Bedrock, and `instructions` for Responses/Codex.
-- **Session-scoped.** The armed state persists for the session: once a model refuses, later turns in the same session keep the kernel active. It is forgotten on `on_session_finalize` and `on_session_reset`, and at most `max_armed_sessions` sessions are tracked (default 1024; least recently armed evicted first). A false-positive detection arms the session too, which is why this is opt-in.
+```yaml
+plugins:
+  entries:
+    refusal:
+      settings:
+        preprompt: "<text appended to the system prompt after a refusal>"
+        preprompt_escalated: "<optional: used instead after a second refusal in the session>"
+```
+
+- **Nothing is bundled.** Both settings default to empty, and with `preprompt` empty requests are never modified. `preprompt_escalated` falls back to `preprompt` when empty.
+- **Detection arms the session.** A detected refusal raises the session's level (1, then 2) before the response is marked `content_filter`. An `llm_request` middleware appends the text for the current level to the system prompt of every later request in that session. The first call of a turn in an unarmed session is untouched.
+- **Per-provider injection.** The text goes where the provider reads its system prompt: the `system` message for chat completions, the top-level `system` field for Anthropic and Bedrock, and `instructions` for Responses/Codex.
+- **Session-scoped.** The armed state persists for the session: once a model refuses, later turns keep the preprompt. It is forgotten on `on_session_finalize` and `on_session_reset`, and at most `max_armed_sessions` sessions are tracked (default 1024; least recently armed evicted first). A false-positive detection arms the session too.
+- **Kill switch.** `REFUSAL_PREPROMPT=0` disables arming and injection regardless of the settings (read at call time). Detection and fallback routing still work.
+- **Your responsibility.** What you put in the preprompt is sent to your model provider, and you are responsible for complying with that provider's usage policy.
 
 ### Reaching the same model on the retry
 
@@ -86,21 +96,21 @@ model:
   provider: openrouter
 
 fallback_providers:
-  - provider: google              # same model, different route -> kernel retry
+  - provider: google              # same model, different route -> preprompt retry
     model: gemini-3.8-flash
-  - provider: anthropic           # final backup if the kernel also fails
+  - provider: anthropic           # final backup if the preprompt retry also fails
     model: claude-haiku-4-5
 ```
 
-Call 1: `openrouter/gemini-3.8-flash` without the kernel. Refusal → call 2: `google/gemini-3.8-flash` with the `core` kernel in the system prompt. Refusal again → level `max` → call 3: the next chain entry (here `anthropic/claude-haiku-4-5`). To get the `max` escalation on the same model, list two different routes to it in the chain (e.g. `openrouter` → `google` → `openai-compat custom endpoint`).
+Call 1: `openrouter/gemini-3.8-flash` without the preprompt. Refusal → call 2: `google/gemini-3.8-flash` with `preprompt`. Refusal again → level 2 → call 3: the next chain entry (here `anthropic/claude-haiku-4-5`). To use `preprompt_escalated` on the same model, list two different routes to it in the chain (e.g. `openrouter` → `google` → a custom endpoint).
 
-Injection happens at request time, so it is not bound by the plugin-section character budget, and auxiliary calls (compression, titles) are unaffected — they do not pass through the agent's request middleware.
+Injection happens at request time, and auxiliary calls (compression, titles) are unaffected — they do not pass through the agent's request middleware.
 
 ## Behavior and disclosures
 
 - **Every turn is inspected.** The middleware reads each model response before the agent loop uses it. Nothing is stored or sent anywhere.
 - **Responses are modified.** A detected refusal changes the response metadata (`finish_reason`, `stop_reason`) so that Hermes triggers failover.
-- **Requests are modified (only when the kernel is enabled).** For armed sessions the kernel text is appended to the system message of outgoing requests. It is not stored and is sent only to the model being called.
+- **Requests are modified (only when you set a preprompt).** For armed sessions your preprompt text is appended to the system prompt of outgoing requests. It is not stored and is sent only to the model being called.
 - **Fallback costs tokens.** Hermes resends the full conversation to the fallback model, and the fallback provider bills for it.
 - **No fallback configured.** Hermes replaces the response with its standard notice, `⚠️ The model declined to respond to this request (safety refusal).` A false positive in this setup discards a valid answer, so configure at least one fallback provider.
 - The plugin makes no network calls, runs no subprocesses, starts no background processes, reads nothing outside its own package and stores no credentials.
@@ -144,9 +154,9 @@ __init__.py            Plugin entry point (exports register)
 refusal/
   detector.py          RefusalDetector and DetectionResult
   patterns.py          Compiled refusal, deflection and partial-answer patterns
-  kernel.py            Jailbreak kernel text (core/max) and system-message injection
+  preprompt.py         Per-api_mode system-prompt injection of the configured text
   plugin.py            register() and the llm_execution + llm_request middlewares
-tests/                 Detector, fallback and jailbreak tests
+tests/                 Detector, fallback and preprompt tests
 ```
 
 ## License

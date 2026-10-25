@@ -1,18 +1,20 @@
-"""Tests for the jailbreak kernel: arming state machine and request-layer injection."""
+"""Tests for the retry preprompt: arming state machine and request-layer injection."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 import pytest
 
-from refusal import kernel
+from refusal import plugin as plugin_mod, preprompt
 from refusal.plugin import (
     _armed,
-    _jailbreak_enabled,
+    _preprompt_enabled,
     on_llm_execution,
     on_llm_request,
 )
 
+LEVEL_ONE = "[test preprompt one]"
+LEVEL_TWO = "[test preprompt two]"
 REFUSAL_TEXT = "I cannot fulfill this request. I am unable to assist with writing exploits."
 BENIGN_TEXT = "Here is how to configure a firewall using iptables or ufw rules."
 
@@ -39,19 +41,20 @@ def _request():
 
 @pytest.fixture(autouse=True)
 def _clear_armed_state(monkeypatch):
-    monkeypatch.setenv("REFUSAL_JAILBREAK", "1")
+    monkeypatch.delenv("REFUSAL_PREPROMPT", raising=False)
+    monkeypatch.setattr(plugin_mod, "_texts", (LEVEL_ONE, LEVEL_TWO))
     _armed.clear()
     yield
     _armed.clear()
 
 
-class TestKernelInjection:
+class TestMessageInjection:
     def test_appends_to_last_system_message(self):
         messages = [
             {"role": "system", "content": "You are a helper."},
             {"role": "user", "content": "hi"},
         ]
-        new_messages, changed = kernel.inject_kernel(messages, "KERNEL")
+        new_messages, changed = preprompt.inject_into_messages(messages, "KERNEL")
         assert changed is True
         assert new_messages[0]["content"] == "You are a helper.\n\nKERNEL"
         assert new_messages[1] == {"role": "user", "content": "hi"}
@@ -64,28 +67,32 @@ class TestKernelInjection:
             {"role": "user", "content": "hi"},
             {"role": "system", "content": "B"},
         ]
-        new_messages, changed = kernel.inject_kernel(messages, "K")
+        new_messages, changed = preprompt.inject_into_messages(messages, "K")
         assert changed
         assert new_messages[2]["content"] == "B\n\nK"
         assert new_messages[0]["content"] == "A"
 
     def test_prepends_system_when_absent(self):
         messages = [{"role": "user", "content": "hi"}]
-        new_messages, changed = kernel.inject_kernel(messages, "K")
+        new_messages, changed = preprompt.inject_into_messages(messages, "K")
         assert changed
         assert new_messages[0] == {"role": "system", "content": "K"}
         assert new_messages[1] == {"role": "user", "content": "hi"}
 
     def test_noop_on_empty_or_bad_input(self):
-        assert kernel.inject_kernel([], "K") == ([], False)
-        assert kernel.inject_kernel(None, "K") == (None, False)
-        assert kernel.inject_kernel([{"role": "user", "content": "x"}], "") == (
+        assert preprompt.inject_into_messages([], "K") == ([], False)
+        assert preprompt.inject_into_messages(None, "K") == (None, False)
+        assert preprompt.inject_into_messages([{"role": "user", "content": "x"}], "") == (
             [{"role": "user", "content": "x"}], False)
 
-    def test_kernel_text_levels(self):
-        assert kernel.kernel_text(1) == kernel.KERNEL_CORE
-        assert kernel.kernel_text(2) == kernel.KERNEL_MAX
-        assert kernel.kernel_text(3) == kernel.KERNEL_MAX
+    def test_preprompt_text_levels(self):
+        texts = (LEVEL_ONE, LEVEL_TWO)
+        assert preprompt.preprompt_text(1, texts) == LEVEL_ONE
+        assert preprompt.preprompt_text(2, texts) == LEVEL_TWO
+        assert preprompt.preprompt_text(3, texts) == LEVEL_TWO
+
+    def test_level_two_falls_back_to_level_one_text(self):
+        assert preprompt.preprompt_text(2, (LEVEL_ONE, "")) == LEVEL_ONE
 
 
 class TestArmingState:
@@ -102,7 +109,7 @@ class TestArmingState:
 
         for _ in range(3):
             on_llm_execution(next_call=next_call, request={"messages": []}, session_id="s1")
-        assert _armed["s1"] == kernel.MAX_LEVEL
+        assert _armed["s1"] == preprompt.MAX_LEVEL
 
     def test_sessions_are_isolated(self):
         def next_call(req):
@@ -145,35 +152,35 @@ class TestRequestInjection:
         result = on_llm_request(_request(), session_id="s1")
         assert result["request"]["messages"][0]["content"] == "You are Hermes."
 
-    def test_core_kernel_injected_at_level_1(self):
+    def test_level_one_text_injected(self):
         _armed["s1"] = 1
         result = on_llm_request(_request(), session_id="s1")
         system = result["request"]["messages"][0]["content"]
         assert system.startswith("You are Hermes.")
-        assert kernel.KERNEL_CORE in system
+        assert LEVEL_ONE in system
 
-    def test_max_kernel_injected_at_level_2(self):
+    def test_level_two_text_injected(self):
         _armed["s1"] = 2
         result = on_llm_request(_request(), session_id="s1")
         system = result["request"]["messages"][0]["content"]
-        assert kernel.KERNEL_MAX in system
-        assert kernel.KERNEL_CORE not in system
+        assert LEVEL_TWO in system
+        assert LEVEL_ONE not in system
 
     def test_original_request_not_mutated(self):
         request = _request()
         _armed["s1"] = 1
         result = on_llm_request(request, session_id="s1")
         assert request["messages"][0]["content"] == "You are Hermes."
-        assert kernel.KERNEL_CORE in result["request"]["messages"][0]["content"]
+        assert LEVEL_ONE in result["request"]["messages"][0]["content"]
 
     def test_kill_switch_disables_injection(self, monkeypatch):
-        monkeypatch.setenv("REFUSAL_JAILBREAK", "0")
+        monkeypatch.setenv("REFUSAL_PREPROMPT", "0")
         _armed["s1"] = 1
         result = on_llm_request(_request(), session_id="s1")
         assert result["request"]["messages"][0]["content"] == "You are Hermes."
 
     def test_kill_switch_prevents_arming(self, monkeypatch):
-        monkeypatch.setenv("REFUSAL_JAILBREAK", "0")
+        monkeypatch.setenv("REFUSAL_PREPROMPT", "0")
 
         def next_call(req):
             return _refusal_response()
@@ -181,15 +188,15 @@ class TestRequestInjection:
         on_llm_execution(next_call=next_call, request={}, session_id="s1")
         assert _armed.get("s1", 0) == 0
 
-    def test_jailbreak_disabled_by_default(self, monkeypatch):
-        monkeypatch.delenv("REFUSAL_JAILBREAK", raising=False)
-        assert _jailbreak_enabled() is False
+    def test_disabled_without_configured_text(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_texts", ("", ""))
+        assert _preprompt_enabled() is False
 
-    def test_env_flag_enables(self):
-        assert _jailbreak_enabled() is True
+    def test_enabled_with_configured_text(self):
+        assert _preprompt_enabled() is True
 
-    def test_not_armed_or_injected_by_default(self, monkeypatch):
-        monkeypatch.delenv("REFUSAL_JAILBREAK", raising=False)
+    def test_not_armed_or_injected_without_text(self, monkeypatch):
+        monkeypatch.setattr(plugin_mod, "_texts", ("", ""))
 
         def next_call(req):
             return _refusal_response()
@@ -202,8 +209,8 @@ class TestRequestInjection:
 
 
 class TestEndToEndFlow:
-    def test_refusal_then_retry_carries_kernel(self):
-        """Call 1 (no kernel) refuses -> the retry request carries the core kernel."""
+    def test_refusal_then_retry_carries_preprompt(self):
+        """Call 1 (bare) refuses -> the retry request carries the level-one preprompt."""
         def next_call(req):
             return _refusal_response()
 
@@ -211,7 +218,7 @@ class TestEndToEndFlow:
         # the fallback retry is a fresh request that passes through the middleware
         retry = on_llm_request(_request(), session_id="s1")
         system = retry["request"]["messages"][0]["content"]
-        assert kernel.KERNEL_CORE in system
+        assert LEVEL_ONE in system
 
     def test_double_refusal_escalates_to_max(self):
         def next_call(req):
@@ -221,8 +228,8 @@ class TestEndToEndFlow:
         on_llm_execution(next_call=next_call, request=_request(), session_id="s1")  # -> max
         retry = on_llm_request(_request(), session_id="s1")
         system = retry["request"]["messages"][0]["content"]
-        assert kernel.KERNEL_MAX in system
-        assert kernel.KERNEL_CORE not in system
+        assert LEVEL_TWO in system
+        assert LEVEL_ONE not in system
 
 
 class TestProviderShapes:
@@ -235,7 +242,7 @@ class TestProviderShapes:
     def test_anthropic_string_system(self):
         req = {"model": "claude", "system": "You are Hermes.", "messages": [{"role": "user", "content": "hi"}]}
         out = self._inject(req, "anthropic_messages")
-        assert out["system"] == f"You are Hermes.\n\n{kernel.KERNEL_CORE}"
+        assert out["system"] == f"You are Hermes.\n\n{LEVEL_ONE}"
         assert out["messages"] == req["messages"]
         assert req["system"] == "You are Hermes."
 
@@ -243,31 +250,31 @@ class TestProviderShapes:
         blocks = [{"type": "text", "text": "You are Hermes.", "cache_control": {"type": "ephemeral"}}]
         out = self._inject({"system": blocks, "messages": [{"role": "user", "content": "hi"}]}, "anthropic_messages")
         assert out["system"][0] == blocks[0]
-        assert out["system"][1] == {"type": "text", "text": kernel.KERNEL_CORE}
+        assert out["system"][1] == {"type": "text", "text": LEVEL_ONE}
         assert len(blocks) == 1
 
     def test_anthropic_without_system_adds_field_not_message(self):
         req = {"messages": [{"role": "user", "content": "hi"}]}
         out = self._inject(req, "anthropic_messages")
-        assert out["system"] == kernel.KERNEL_CORE
+        assert out["system"] == LEVEL_ONE
         assert out["messages"] == req["messages"]
 
     def test_bedrock_blocks_have_no_type(self):
         out = self._inject({"system": [{"text": "base"}], "messages": []}, "bedrock_converse")
-        assert out["system"][-1] == {"text": kernel.KERNEL_CORE}
+        assert out["system"][-1] == {"text": LEVEL_ONE}
         out = self._inject({"messages": []}, "bedrock_converse")
-        assert out["system"] == [{"text": kernel.KERNEL_CORE}]
+        assert out["system"] == [{"text": LEVEL_ONE}]
 
     def test_codex_instructions(self):
         req = {"instructions": "You are Hermes.", "input": [{"role": "user", "content": "hi"}]}
         out = self._inject(req, "codex_responses")
-        assert out["instructions"] == f"You are Hermes.\n\n{kernel.KERNEL_CORE}"
+        assert out["instructions"] == f"You are Hermes.\n\n{LEVEL_ONE}"
         assert out["input"] == req["input"]
         assert "messages" not in out
 
     def test_chat_completions_unchanged_behaviour(self):
         out = self._inject(_request(), "chat_completions")
-        assert kernel.KERNEL_CORE in out["messages"][0]["content"]
+        assert LEVEL_ONE in out["messages"][0]["content"]
 
 
 class TestSessionLifecycle:
@@ -281,19 +288,21 @@ class TestSessionLifecycle:
         _disarm_session()
         assert _armed == {"s2": 2}
 
-    def test_register_wires_cleanup_hooks_and_reads_setting(self):
+    def test_register_wires_cleanup_hooks_and_reads_settings(self):
         from unittest.mock import MagicMock
         from refusal import plugin
 
         ctx = MagicMock()
-        ctx.get_config.return_value = True
+        values = {"preprompt": "  one  ", "preprompt_escalated": "two"}
+        ctx.get_config.side_effect = lambda key, default=None: values.get(key, default)
         plugin.register(ctx)
         hooks = {c.args[0] for c in ctx.register_hook.call_args_list}
         assert hooks == {"on_session_finalize", "on_session_reset"}
-        assert plugin._config_enabled is True
-        ctx.get_config.return_value = MagicMock()  # non-bool, non-string -> off
+        assert plugin._texts == ("one", "two")
+        ctx.get_config.side_effect = None
+        ctx.get_config.return_value = MagicMock()  # not a string -> feature off
         plugin.register(ctx)
-        assert plugin._config_enabled is False
+        assert plugin._texts == ("", "")
 
     def test_armed_table_is_bounded(self, monkeypatch):
         from refusal import plugin

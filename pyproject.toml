@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes-refusal-plugin"
 version = "0.2.0"
-description = "Detects model refusals and deflections, retries the turn on a fallback model, and injects a jailbreak kernel into the retry"
+description = "Detects model refusals and deflections, retries the turn on a fallback model, and can add user-supplied text to the retry's system prompt"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [

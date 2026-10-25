@@ -1,5 +1,5 @@
 """llm_execution middleware that routes refusals into Hermes provider fallback,
-plus the jailbreak kernel that pre-prompts the fallback retry."""
+plus the optional user-supplied preprompt for the fallback retry."""
 
 from __future__ import annotations
 
@@ -9,16 +9,16 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-from . import kernel
+from . import preprompt
 from .detector import DetectionResult, RefusalDetector
 
 logger = logging.getLogger(__name__)
 
 _detector = RefusalDetector()
 
-#: Per-session kernel arming level (0 = unarmed). A detected refusal raises the
-#: level by one (capped at kernel.MAX_LEVEL); the llm_request middleware injects
-#: the active kernel text into the system message of every request for an armed
+#: Per-session arming level (0 = unarmed). A detected refusal raises the
+#: level by one (capped at preprompt.MAX_LEVEL); the llm_request middleware injects
+#: the configured preprompt into the system message of every request for an armed
 #: session, so the fallback retry carries the preprompt.
 _armed: OrderedDict[str, int] = OrderedDict()
 _armed_lock = threading.Lock()
@@ -28,8 +28,9 @@ _armed_lock = threading.Lock()
 DEFAULT_MAX_ARMED_SESSIONS = 1024
 _max_armed_sessions = DEFAULT_MAX_ARMED_SESSIONS
 
-#: Opt-in switch from the ``jailbreak_kernel`` plugin setting, captured in register().
-_config_enabled = False
+#: User-supplied preprompt texts (level 1, level 2+) from the plugin settings, captured
+#: in register(). Both empty means the feature is off.
+_texts: tuple[str, str] = ("", "")
 
 _TRUE = {"1", "on", "true", "yes"}
 _FALSE = {"0", "off", "false", "no"}
@@ -179,19 +180,15 @@ def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
         setattr(response, "incomplete_details", {"reason": "content_filter"})
 
 
-def _jailbreak_enabled() -> bool:
-    """Opt-in switch for kernel arming/injection (off unless enabled).
+def _preprompt_enabled() -> bool:
+    """True when the user configured a preprompt and has not switched it off.
 
-    ``REFUSAL_JAILBREAK`` overrides the ``jailbreak_kernel`` plugin setting in both
-    directions and is read at call time. Detection and fallback routing are
-    unaffected either way.
+    ``REFUSAL_PREPROMPT=0`` (or off/false/no) disables arming and injection, read at call
+    time. Detection and fallback routing are unaffected either way.
     """
-    override = os.environ.get("REFUSAL_JAILBREAK", "").strip().lower()
-    if override in _TRUE:
-        return True
-    if override in _FALSE:
+    if os.environ.get("REFUSAL_PREPROMPT", "").strip().lower() in _FALSE:
         return False
-    return _config_enabled
+    return bool(_texts[0])
 
 
 def _session_id_from_context(kwargs: Any) -> str:
@@ -200,9 +197,9 @@ def _session_id_from_context(kwargs: Any) -> str:
 
 
 def _arm_session(session_id: str) -> int:
-    """Raise the session's kernel level by one (capped) and return the new level."""
+    """Raise the session's level by one (capped) and return the new level."""
     with _armed_lock:
-        level = min(_armed.get(session_id, 0) + 1, kernel.MAX_LEVEL)
+        level = min(_armed.get(session_id, 0) + 1, preprompt.MAX_LEVEL)
         _armed[session_id] = level
         _armed.move_to_end(session_id)
         while len(_armed) > _max_armed_sessions:
@@ -211,13 +208,13 @@ def _arm_session(session_id: str) -> int:
 
 
 def _disarm_session(session_id: str = "", **_: Any) -> None:
-    """Forget a session's kernel level when Hermes finalizes or resets it."""
+    """Forget a session's level when Hermes finalizes or resets it."""
     with _armed_lock:
         _armed.pop(str(session_id or ""), None)
 
 
 def on_llm_request(request: Any, **context: Any) -> dict:
-    """Append the armed kernel to the system message of outgoing requests.
+    """Append the configured preprompt to the system prompt of outgoing requests.
 
     Runs before every provider call. Requests for unarmed sessions (level 0)
     pass through untouched, so a turn's first call is made without the
@@ -227,17 +224,17 @@ def on_llm_request(request: Any, **context: Any) -> dict:
     if not isinstance(request, dict):
         return {"request": request}
     try:
-        if _jailbreak_enabled():
+        if _preprompt_enabled():
             session_id = _session_id_from_context(context)
             with _armed_lock:
                 level = _armed.get(session_id, 0)
             if session_id and level >= 1:
-                new_request, changed = kernel.inject_into_request(
-                    request, kernel.kernel_text(level), str(context.get("api_mode") or "")
+                new_request, changed = preprompt.inject_into_request(
+                    request, preprompt.preprompt_text(level, _texts), str(context.get("api_mode") or "")
                 )
                 if changed:
                     logger.info(
-                        "jailbreak kernel injected (session=%s level=%d model=%s)",
+                        "preprompt injected (session=%s level=%d model=%s)",
                         session_id, level, context.get("model"),
                     )
                     return {"request": new_request}
@@ -263,23 +260,21 @@ def on_llm_execution(**kwargs: Any) -> Any:
         detection = _detector.detect(text)
         if detection.is_refusal:
             session_id = _session_id_from_context(kwargs)
-            if session_id and _jailbreak_enabled():
+            if session_id and _preprompt_enabled():
                 level = _arm_session(session_id)
-                logger.info("jailbreak armed for session %s (level=%d)", session_id, level)
+                logger.info("preprompt armed for session %s (level=%d)", session_id, level)
             _mark_as_refusal(response, detection)
 
     return response
 
 
-def _setting_enabled(ctx: Any) -> bool:
-    """Read the ``jailbreak_kernel`` plugin setting (False when absent or not a boolean/flag string)."""
+def _setting_text(ctx: Any, key: str) -> str:
+    """Read a string plugin setting (empty when absent or not a string)."""
     try:
-        value = ctx.get_config("jailbreak_kernel", False)
+        value = ctx.get_config(key, "")
     except Exception:
-        return False
-    if isinstance(value, bool):
-        return value
-    return isinstance(value, str) and value.strip().lower() in _TRUE
+        return ""
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _setting_max_sessions(ctx: Any) -> int:
@@ -295,8 +290,8 @@ def _setting_max_sessions(ctx: Any) -> int:
 
 def register(ctx: Any) -> None:
     """Register the middlewares and the session-cleanup hooks with Hermes."""
-    global _config_enabled, _max_armed_sessions
-    _config_enabled = _setting_enabled(ctx)
+    global _texts, _max_armed_sessions
+    _texts = (_setting_text(ctx, "preprompt"), _setting_text(ctx, "preprompt_escalated"))
     _max_armed_sessions = _setting_max_sessions(ctx)
     if hasattr(ctx, "register_middleware"):
         ctx.register_middleware("llm_execution", on_llm_execution)

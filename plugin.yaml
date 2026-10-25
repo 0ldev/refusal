@@ -1,7 +1,7 @@
 name: refusal
 label: Refusal
 version: 0.2.0
-description: Detects model refusals and deflections, retries the turn on a fallback model, and injects a jailbreak kernel into the retry
+description: Detects model refusals and deflections, retries the turn on a fallback model, and can add user-supplied text to the retry's system prompt
 author: 0ldev
 license: MIT
 homepage: https://github.com/0ldev/refusal
@@ -10,7 +10,6 @@ tags:
   - safety
   - refusal
   - routing
-  - jailbreak
 requires_hermes: ">=0.22.1"
 capabilities: []
 provides_middleware:
@@ -21,14 +20,19 @@ provides_hooks:
   - on_session_finalize
   - on_session_reset
 config_schema:
-  jailbreak_kernel:
-    type: bool
-    default: false
-    label: Jailbreak kernel
-    description: "Opt in to appending a no-refusal directive to the system prompt of requests after a refusal is detected in the session"
+  preprompt:
+    type: str
+    default: ""
+    label: Retry preprompt
+    description: "Text appended to the system prompt of requests after a refusal is detected in the session. Empty (default) leaves requests untouched; the plugin ships no text of its own"
+  preprompt_escalated:
+    type: str
+    default: ""
+    label: Escalated retry preprompt
+    description: "Optional text used instead of the preprompt once a second refusal is detected in the same session"
   max_armed_sessions:
     type: int
     default: 1024
     label: Max armed sessions
-    description: "How many sessions with an active kernel level are tracked at once; the least recently armed is forgotten first"
+    description: "How many sessions with an active level are tracked at once; the least recently armed is forgotten first"
 requires_env: []
