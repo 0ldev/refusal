@@ -156,7 +156,7 @@ Injected requests also carry `source: refusal` and a `reason` in Hermes's middle
 
 ### Persistence (optional)
 
-By default armed levels live in process memory. With `persist_state: true` the plugin keeps them in Hermes's per-plugin state store (`ctx.state`, a JSON file under `<HERMES_HOME>/plugin-data/refusal/state.json`, written atomically under a cross-process file lock), so:
+By default armed levels live in process memory. With `persist_state: true` the plugin keeps them in Hermes's per-plugin state store (`ctx.state`, a JSON file `state.json` in this plugin's directory under `<HERMES_HOME>/plugin-data/`, written atomically under a cross-process file lock), so:
 
 - an armed session survives a gateway restart, and
 - several processes serving the same profile see the same levels.
