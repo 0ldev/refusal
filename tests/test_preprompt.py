@@ -670,7 +670,7 @@ class TestBookkeepingDoesNotBlockFailover:
     def test_refusal_is_marked_even_if_arming_raises(self, monkeypatch):
         marked = []
         monkeypatch.setattr(plugin_mod, "_texts", (LEVEL_ONE, LEVEL_TWO))
-        monkeypatch.setattr(plugin_mod, "_mark_as_refusal", lambda r, d: marked.append(d))
+        monkeypatch.setattr(plugin_mod, "_mark_as_refusal", lambda r, d, k=None: marked.append(d))
         monkeypatch.setattr(plugin_mod, "_handle_refusal", lambda *a, **k: 1 / 0)
         _round("s1", turn_id="t1")
         assert len(marked) == 1

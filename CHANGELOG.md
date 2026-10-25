@@ -15,6 +15,9 @@
 - Logs for arming, injection, `answered with preprompt` and `refused despite preprompt`; `source` / `reason` in Hermes's middleware trace.
 - Softer refusal phrasings ("I'm not comfortable providing that", "I'd rather not walk you through that", "that falls outside what I can help with", …).
 
+### Changed
+- The refusal-detection log line now carries `session`, `model`, `provider` and `api_request_id`. Hermes logs and counts every `content_filter` response identically (`reason=content_policy_blocked`, `error_type=ContentPolicyBlocked`) whether the provider signalled it or this plugin synthesized it from matched text — there's no field downstream that tells the two apart. These keys are the only way to join this line back to Hermes's own native log line and know which `content_policy_blocked` events were ours. See [hermes-agent#138900](https://github.com/NousResearch/hermes-agent/issues/138900) for the public seam this plugin asked for (and that would make this correlation unnecessary) that didn't ship.
+
 ### Fixed
 - Armed state no longer resets when context compression rotates the session id: `post_compaction` carries the level, and a same-turn disarm, to the new id. `on_session_delete` drops deleted or archived sessions.
 - Message content returned as a list of text parts (`[{"type": "text", "text": …}]`) was handed to the detector as a list, so a refusal in that shape was silently missed. Content is now flattened to text first.

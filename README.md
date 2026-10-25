@@ -143,7 +143,7 @@ The text is added where each provider reads its system prompt: the `system` mess
 
 | Level | Message | Meaning |
 |---|---|---|
-| WARNING | `Refusal detected (kind=…, reason=…, text=…)` | A text refusal was matched and the response marked |
+| WARNING | `Refusal detected (kind=…, reason=…, text=…, session=…, model=…, provider=…, api_request_id=…)` | A text refusal was matched and the response marked. The correlation fields are there so this line can be joined back to Hermes's own `content_policy_blocked` line — see [Limitations](#limitations) |
 | INFO | `provider-signalled refusal (…)` | The provider flagged the response itself |
 | INFO | `preprompt armed (session=… level=1)` | First refusal in the session |
 | INFO | `preprompt injected (session=… level=… provider=… model=…)` | A request was modified |
@@ -205,6 +205,7 @@ Injection happens at request time, and auxiliary calls (compression, titles) are
 
 - **Pattern-based.** An unusual refusal phrasing can be missed, and a reply that quotes refusal language can be flagged. Inability that is explained by a technical reason ("I can't run that because the container has no network", "The repository is read-only") is recognized as a genuine answer, but only for the phrasings the filter knows, and never when the same stretch mentions policy or harm. Configure a fallback so a false positive does not discard the answer.
 - **Cannot see the fallback chain.** Hermes does not tell middleware whether a fallback exists, so with none configured the plugin still marks and arms, and Hermes shows the safety notice.
+- **Telemetry is conflated with real provider refusals.** Marking a response `content_filter` makes Hermes log and count it exactly like a provider's own safety-classifier block (`reason=content_policy_blocked`, `error_type=ContentPolicyBlocked` — see `agent/turn_truncation.py`); nothing downstream distinguishes a plugin match from a real one. The detection log line carries `session`/`model`/`provider`/`api_request_id` specifically so you can join it back to Hermes's native log line and tell them apart by hand; there is no way to fix the aggregate counts themselves from a plugin. [hermes-agent#138900](https://github.com/NousResearch/hermes-agent/issues/138900) asked for a public seam (a distinct registered failover reason) to avoid this; it was closed once this plugin shipped the workaround, without the seam landing.
 - **Same-model retries need a different route.** Hermes skips fallback entries that resolve to the backend that just failed (see below).
 - **State is per process by default.** Armed levels are not shared between gateway workers or processes and are lost on restart, unless you enable [`persist_state`](#persistence-optional).
 - **Request copying.** Registering a `llm_request` middleware makes Hermes deep-copy each outgoing payload once or twice (about 1 ms for a 700 KB request in my measurement), whether or not you configured a preprompt. The plugin returns `None` for requests it does not change, so Hermes records no trace entry and makes no further copy for them.

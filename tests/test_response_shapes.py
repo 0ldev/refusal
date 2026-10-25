@@ -93,29 +93,29 @@ class TestMarking:
 
     def test_chat_object_gets_content_filter_and_refusal_field(self):
         resp = _chat_obj(REFUSAL, refusal=None)
-        P._mark_as_refusal(resp, self.DET)
+        P._mark_as_refusal(resp, self.DET, {})
         assert resp.choices[0].finish_reason == "content_filter"
         assert "direct_refusal" in resp.choices[0].message.refusal
 
     def test_chat_dict(self):
         resp = _chat_dict(REFUSAL)
-        P._mark_as_refusal(resp, self.DET)
+        P._mark_as_refusal(resp, self.DET, {})
         assert resp["choices"][0]["finish_reason"] == "content_filter"
 
     def test_anthropic_object_and_dict(self):
         obj = NS(content=[NS(type="text", text=REFUSAL)], stop_reason="end_turn")
-        P._mark_as_refusal(obj, self.DET)
+        P._mark_as_refusal(obj, self.DET, {})
         assert obj.stop_reason == "refusal"
         dct = {"content": [{"type": "text", "text": REFUSAL}], "stop_reason": "end_turn"}
-        P._mark_as_refusal(dct, self.DET)
+        P._mark_as_refusal(dct, self.DET, {})
         assert dct["stop_reason"] == "refusal"
 
     def test_responses_object_and_dict(self):
         obj = NS(status="completed", output=[])
-        P._mark_as_refusal(obj, self.DET)
+        P._mark_as_refusal(obj, self.DET, {})
         assert obj.status == "incomplete" and obj.incomplete_details == {"reason": "content_filter"}
         dct = {"status": "completed"}
-        P._mark_as_refusal(dct, self.DET)
+        P._mark_as_refusal(dct, self.DET, {})
         assert dct["status"] == "incomplete" and dct["incomplete_details"] == {"reason": "content_filter"}
 
     def test_marked_responses_are_recognised_as_native_on_a_second_pass(self):

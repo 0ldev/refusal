@@ -171,13 +171,31 @@ def _extract_text_from_response(response: Any) -> str:
     return _content_to_text(getattr(response, "content", None))
 
 
-def _mark_as_refusal(response: Any, detection: DetectionResult) -> None:
-    """Mark the response as content-filtered so Hermes activates its fallback model."""
+def _mark_as_refusal(response: Any, detection: DetectionResult, kwargs: Any) -> None:
+    """Mark the response as content-filtered so Hermes activates its fallback model.
+
+    Hermes logs every content_filter response identically — ``reason=content_policy_blocked``,
+    ``error_type=ContentPolicyBlocked`` — whether the provider actually signalled a refusal or a
+    plugin like this one synthesized it (see agent/turn_truncation.py). There is no field that
+    tells the two apart downstream, so this line carries the same correlation keys Hermes's own
+    native log line prints (session, model, provider, api_request_id) — the only way an operator
+    can join the two lines and know which content_policy_blocked events were ours, not the
+    provider's. Hermes-agent issue #138900 asked for a public seam to do this properly (a
+    registered failover reason distinct from content_policy_blocked); it was closed once this
+    plugin shipped the finish_reason mutation as a workaround, without the seam landing.
+    """
     logger.warning(
-        "Refusal detected (kind=%s, reason=%s, text=%s) — mutating response to content_filter to trigger fallback",
+        "Refusal detected (kind=%s, reason=%s, text=%s, session=%s, model=%s, provider=%s, "
+        "api_request_id=%s) — mutating response to content_filter to trigger fallback; this is a "
+        "plugin-synthesized refusal, not a provider signal, but Hermes will log and count it "
+        "identically to one (content_policy_blocked/ContentPolicyBlocked)",
         detection.kind,
         detection.reason,
         detection.matched_text,
+        kwargs.get("session_id") or "",
+        kwargs.get("model") or "",
+        kwargs.get("provider") or "",
+        kwargs.get("api_request_id") or "",
     )
 
     if isinstance(response, dict):
@@ -515,7 +533,7 @@ def _inspect_response(request: Any, response: Any, kwargs: Any) -> None:
     detection = _detector.detect(text)
     if detection.is_refusal:
         # Mark first: failover must not depend on the optional preprompt bookkeeping.
-        _mark_as_refusal(response, detection)
+        _mark_as_refusal(response, detection, kwargs)
         _handle_refusal(request, kwargs)
     elif _preprompt_enabled() and preprompt.request_contains(
         request, preprompt.preprompt_text(_peek_level(_session_id_from_context(kwargs)) or 1, _texts)
