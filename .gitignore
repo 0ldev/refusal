@@ -6,3 +6,10 @@ __pycache__/
 dist/
 build/
 .coverage
+
+# AI-assistant artifacts (local-only, never committed)
+AGENTS.md
+.claude/
+.hermes/
+.gemini/
+tmp/
